@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "omassistant",
+  "name": "Omassistant",
+  "version": "0.9.0",
+  "author": "Tom-Erik",
+  "description": "A permissioned, screen-aware assistant for the Omarchy desktop.",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Omassistant.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omassistant",
+    "description": "Summon the desktop assistant",
+    "category": "Assistant",
+    "allowMultiple": false
+  }
+}

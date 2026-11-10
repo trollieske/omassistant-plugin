@@ -1,0 +1,21 @@
+[package]
+name = "omassistantd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Omassistant's capability broker: desktop capabilities with consent and an audit log"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", default-features = false, features = ["std", "formatting", "local-offset"] }
+
+[[bin]]
+name = "omassistantd"
+path = "src/bin/omassistantd.rs"
+
+[[bin]]
+name = "omassistantctl"
+path = "src/bin/omassistantctl.rs"
