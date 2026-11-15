@@ -32,6 +32,8 @@ pub enum ErrorCode {
     TtlOutOfRange,
     /// No window is focused, so there is nothing to capture or type into.
     NoWindow,
+    /// The focused window is no longer the one the person approved, so nothing was done.
+    FocusMoved,
     /// No monitor reports focus, so there is nothing to capture.
     NoMonitor,
     /// The geometry reported by the compositor is not capturable (zero or absurd size).
@@ -75,6 +77,7 @@ impl ErrorCode {
             Self::CapabilityUnknown => "capability_unknown",
             Self::TtlOutOfRange => "ttl_out_of_range",
             Self::NoWindow => "no_window",
+            Self::FocusMoved => "focus_moved",
             Self::NoMonitor => "no_monitor",
             Self::InvalidGeometry => "invalid_geometry",
             Self::CaptureFailed => "capture_failed",
@@ -174,6 +177,7 @@ mod tests {
             ErrorCode::CapabilityUnknown,
             ErrorCode::TtlOutOfRange,
             ErrorCode::NoWindow,
+            ErrorCode::FocusMoved,
             ErrorCode::NoMonitor,
             ErrorCode::InvalidGeometry,
             ErrorCode::CaptureFailed,

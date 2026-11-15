@@ -46,7 +46,7 @@ fn tools() -> Value {
         "tools": [
             {
                 "name": "act_type",
-                "description": "Type text into the focused app, as the person confirming in the card would type it. One action; newlines and tabs are allowed.",
+                "description": "Type text into the focused app, as the person confirming in the card would type it. One action; newlines and tabs are allowed. If focus changes while the card waits, the call fails with focus_moved and nothing is typed: the window that was approved is the only one that gets the text, so ask again rather than assuming it landed.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -58,7 +58,7 @@ fn tools() -> Value {
             },
             {
                 "name": "act_key",
-                "description": "Press one key chord in the focused app. Keys are app input, not compositor shortcuts: this cannot trigger a Hyprland keybind. Examples: escape, return, tab, super+return, ctrl+shift+t, alt+F4.",
+                "description": "Press one key chord in the focused app. Keys are app input, not compositor shortcuts: this cannot trigger a Hyprland keybind. Examples: escape, return, tab, super+return, ctrl+shift+t, alt+F4. An approval covers that one window only; if focus moved, the call fails with focus_moved and no key is pressed.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -95,7 +95,7 @@ fn tools() -> Value {
             },
             {
                 "name": "act_pointer",
-                "description": "Click, double-click, right-click, scroll or move the real pointer inside the focused window. x and y are fractions of that window (0,0 is its top-left; 1,1 its bottom-right), so the same numbers work on any monitor or scale. Take observe_screen first to see where the control is. The card steps aside.",
+                "description": "Click, double-click, right-click, scroll or move the real pointer inside the focused window. x and y are fractions of that window (0,0 is its top-left; 1,1 its bottom-right), so the same numbers work on any monitor or scale. Take observe_screen first to see where the control is. The card steps aside. If focus moved while the card waited, the call fails with focus_moved and nothing is clicked.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -128,7 +128,7 @@ fn tools() -> Value {
             },
             {
                 "name": "observe_screen",
-                "description": "Capture the focused window (or the whole screen) and return it as an image, after the person confirms. Use it only when the question is about what is on screen.",
+                "description": "Capture the focused window (or the whole screen) and return it as an image, after the person confirms. Use it only when the question is about what is on screen. The capture is taken from the window that was approved, as it is after the answer; if a different window has focus by then, the call fails with focus_moved and no image is taken.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

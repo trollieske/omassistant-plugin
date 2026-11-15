@@ -296,10 +296,43 @@ impl Broker {
             trace,
             now_unix,
         )?;
-        let (window, monitor) = match facts {
-            Some(facts) => facts,
-            None => self.capture_facts(target, trace)?,
-        };
+        // Read the facts again after the answer: the confirmation named a window and a
+        // rectangle, and both can change while the card waits. The fresh read is what gets
+        // captured, so the bytes match the window that is actually there now — and if it is not
+        // the window that was approved, nothing is captured at all. The audit then keeps naming
+        // what the person approved, not what happened to be in front of the camera.
+        let approved_app = facts
+            .as_ref()
+            .and_then(|(window, _)| window.as_ref().map(|window| window.class.clone()));
+        let approved_geometry = facts
+            .as_ref()
+            .and_then(|(window, _)| window.as_ref().map(|window| window.rect.geometry()));
+        let (window, monitor) = self.capture_facts(target, trace)?;
+        if let Some((approved_window, approved_monitor)) = facts {
+            let refusal = match (target, &approved_window, &window) {
+                (Target::Window, Some(approved), Some(now)) if !now.same_window(approved) => {
+                    Some("the window changed after that approval, so nothing was captured")
+                }
+                (Target::Screen, _, _) => match &approved_monitor {
+                    Some(approved)
+                        if monitor.as_ref().map(|now| now.name.as_str())
+                            != Some(approved.name.as_str()) =>
+                    {
+                        Some(
+                            "the focused screen changed after that approval, so nothing was \
+                             captured",
+                        )
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(message) = refusal {
+                trace.app = approved_app;
+                trace.geometry = approved_geometry;
+                return Err(focus_moved(message));
+            }
+        }
 
         let name = format!(
             "{}-{}.png",
@@ -430,12 +463,14 @@ impl Broker {
             trace,
             now_unix,
         )?;
-        let target = match known {
-            Some(target) => target,
+        let target = match &known {
+            Some(target) => target.clone(),
             None => self.focused_window(trace)?,
         };
 
-        self.actor.type_text(text)?;
+        // When the card approved this, the approval named a window: the text goes there or
+        // nowhere. Without a confirmation nothing waited, so there is nothing to re-check.
+        self.actor.type_text(text, known.as_ref())?;
         self.charge(&grant, caps::ACT_TYPE.name, now_unix)?;
         Ok(json!({
             "method": "act.type",
@@ -491,12 +526,14 @@ impl Broker {
             trace,
             now_unix,
         )?;
-        let target = match known {
-            Some(target) => target,
+        let target = match &known {
+            Some(target) => target.clone(),
             None => self.focused_window(trace)?,
         };
 
-        self.actor.press(&chord)?;
+        // The same re-check as act.type: a 60-second key approval is bound to one window, and
+        // `wtype` follows focus, so the keys only go out if that window still has it.
+        self.actor.press(&chord, known.as_ref())?;
         self.charge(&grant, caps::ACT_KEYS.name, now_unix)?;
         Ok(json!({
             "method": "act.key",
@@ -572,13 +609,12 @@ impl Broker {
             trace,
             now_unix,
         )?;
-        let target = match known {
-            Some(target) => target,
+        let target = match &known {
+            Some(target) => target.clone(),
             None => self.focused_window(trace)?,
         };
         trace.app = Some(target.class.clone());
-        self.actor
-            .pointer(action, nx, ny, dx, dy, Some(target.class.as_str()))?;
+        self.actor.pointer(action, nx, ny, dx, dy, known.as_ref())?;
         self.charge(&grant, caps::ACT_POINTER.name, now_unix)?;
         Ok(json!({
             "method": "act.pointer",
@@ -1318,6 +1354,11 @@ fn wants_confirmation(params: &Map<String, Value>) -> bool {
         .get("interactive")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The window, or the screen, is no longer the one the person approved.
+fn focus_moved(message: &str) -> ApiError {
+    ApiError::new(ErrorCode::FocusMoved, message)
 }
 
 /// A one-line, length-capped preview for a confirmation summary.

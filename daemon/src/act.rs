@@ -21,6 +21,19 @@
 //! overlay has to close before the keys are sent, or the keys land in the overlay. That ordering is
 //! the caller's job; the broker refuses with `no_window` when nothing is focused at all.
 //!
+//! # The window that was approved is read again
+//!
+//! A confirmation can wait seconds for an answer, and the person is free to change windows while it
+//! waits — so the window the card named is not necessarily the window that has focus when the
+//! action runs. Every acting call therefore takes the window it was approved in
+//! ([`FocusedWindow`]) and reads the compositor once more immediately before the tool runs,
+//! refusing with [`ErrorCode::FocusMoved`] when it is no longer that window. Class and address
+//! both have to match, so a second window of the same app is not mistaken for the first. A call
+//! that came from a standing grant — nothing was named, nothing waited — passes `None`.
+//!
+//! The re-check happens in this module, next to the tool, so no caller can skip it by forgetting to
+//! ask.
+//!
 //! # Spelling, verified against wtype 0.4 on this machine
 //!
 //! * modifiers are `shift`, `capslock`, `ctrl`, `logo`, `win`, `alt`, `altgr` — **not** `super`;
@@ -214,6 +227,9 @@ pub fn pointer_action(action: &str) -> Result<&'static str, ApiError> {
 pub struct FocusedWindow {
     /// The application class. This is the one that goes into the audit log.
     pub class: String,
+    /// The compositor's address for this window (`0x…`), or empty when it reports none. Tells two
+    /// windows of the same class apart; never logged.
+    pub address: String,
     /// The window title. Goes to the caller, never to the audit log.
     pub title: String,
     /// The window's global logical position.
@@ -224,6 +240,24 @@ pub struct FocusedWindow {
     pub width: i32,
     /// The window's logical height.
     pub height: i32,
+}
+
+impl FocusedWindow {
+    /// Is this the same window as `other`?
+    ///
+    /// The class is the app the person approved. The address is the exact instance, compared when
+    /// both sides have one: a compositor that omits it (or an older Hyprland) still gets the class
+    /// check rather than no check at all.
+    #[must_use]
+    fn same_window(&self, other: &Self) -> bool {
+        if self.class != other.class {
+            return false;
+        }
+        if self.address.is_empty() || other.address.is_empty() {
+            return true;
+        }
+        self.address.eq_ignore_ascii_case(&other.address)
+    }
 }
 
 /// The acting engine: three fixed tools behind an injectable runner.
@@ -258,6 +292,28 @@ impl Actor {
             ));
         }
         parse_focused_window(&output.stdout)
+    }
+
+    /// Read the focused window again and require it to still be `approved`.
+    ///
+    /// Returns the window as it is now, or [`ErrorCode::FocusMoved`] — in which case the caller
+    /// must not run the tool. `what` finishes the sentence ("nothing was typed").
+    fn recheck_focus(
+        &self,
+        approved: &FocusedWindow,
+        what: &str,
+    ) -> Result<FocusedWindow, ApiError> {
+        let window = self.focused_window()?;
+        if !window.same_window(approved) {
+            return Err(ApiError::new(
+                ErrorCode::FocusMoved,
+                format!(
+                    "the focused window changed after that approval, so {what}; approve it again \
+                     in the window you mean"
+                ),
+            ));
+        }
+        Ok(window)
     }
 
     /// Start a fixed launch action. No caller-supplied argument ever reaches the command.
@@ -303,8 +359,15 @@ impl Actor {
     /// The text goes over stdin, never argv: `/proc/<pid>/cmdline` is world-readable, and what
     /// someone asks the assistant to type may be private. Validation happens here as well as in the
     /// broker so no caller can hand `wtype` something unchecked.
-    pub fn type_text(&self, text: &str) -> Result<(), ApiError> {
+    ///
+    /// `approved` is the window the person confirmed; the compositor is read again and the text is
+    /// refused with [`ErrorCode::FocusMoved`] if focus moved on. Validation comes first, so a
+    /// refused text never even asks the compositor.
+    pub fn type_text(&self, text: &str, approved: Option<&FocusedWindow>) -> Result<(), ApiError> {
         validate_text(text)?;
+        if let Some(approved) = approved {
+            self.recheck_focus(approved, "nothing was typed")?;
+        }
         let output = self
             .runner
             .run_with_input("wtype", &["-"], text.as_bytes(), ACT_TIMEOUT)?;
@@ -318,7 +381,14 @@ impl Actor {
     }
 
     /// Press one validated chord: `wtype -M <mod>… -k <key> -m <mod>…` (released in reverse).
-    pub fn press(&self, chord: &Chord) -> Result<(), ApiError> {
+    ///
+    /// `approved` works as in [`Self::type_text`]: the keys only go out if the approved window is
+    /// still the focused one. A key approval is a 60-second run inside one window, so this is the
+    /// check that keeps the run from following focus into another app.
+    pub fn press(&self, chord: &Chord, approved: Option<&FocusedWindow>) -> Result<(), ApiError> {
+        if let Some(approved) = approved {
+            self.recheck_focus(approved, "nothing was pressed")?;
+        }
         let args = chord.args();
         let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
         let output = self.runner.run("wtype", &borrowed, ACT_TIMEOUT)?;
@@ -334,6 +404,9 @@ impl Actor {
     /// Move the real pointer inside the focused window and click, scroll or just
     /// move it. `nx`/`ny` are 0..1 window fractions; the click is a Wayland
     /// virtual-pointer event (`wlrctl`), never uinput or a root daemon.
+    ///
+    /// `approved` works as in [`Self::type_text`]. The coordinates always come from the window as
+    /// it is now, so a window that kept focus but moved is clicked where it actually is.
     pub fn pointer(
         &self,
         action: &str,
@@ -341,7 +414,7 @@ impl Actor {
         ny: f64,
         dx: i32,
         dy: i32,
-        expected_class: Option<&str>,
+        approved: Option<&FocusedWindow>,
     ) -> Result<(), ApiError> {
         let action = pointer_action(action)?;
         if !(0.0..=1.0).contains(&nx)
@@ -353,15 +426,10 @@ impl Actor {
                 "\"x\" and \"y\" must be numbers from 0 to 1 (a fraction of the window)",
             ));
         }
-        let window = self.focused_window()?;
-        if let Some(expected) = expected_class {
-            if window.class != expected {
-                return Err(ApiError::new(
-                    ErrorCode::NoWindow,
-                    "the focused window changed before the click; nothing was pressed",
-                ));
-            }
-        }
+        let window = match approved {
+            Some(approved) => self.recheck_focus(approved, "nothing was clicked")?,
+            None => self.focused_window()?,
+        };
         if window.width <= 0 || window.height <= 0 {
             return Err(ApiError::new(
                 ErrorCode::NoWindow,
@@ -575,6 +643,13 @@ pub fn parse_focused_window(stdout: &[u8]) -> Result<FocusedWindow, ApiError> {
     };
     Ok(FocusedWindow {
         class: text("class"),
+        address: crate::capture::clamp_address(
+            object
+                .get("address")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
         title: text("title"),
         x: number("at", 0),
         y: number("at", 1),
@@ -1108,7 +1183,7 @@ mod tests {
     #[test]
     fn typing_goes_through_wtype_on_stdin_and_nothing_else() {
         let recorder = Arc::new(Recorder::new());
-        actor(&recorder).type_text("hello world").unwrap();
+        actor(&recorder).type_text("hello world", None).unwrap();
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, "wtype");
@@ -1123,7 +1198,7 @@ mod tests {
     #[test]
     fn a_leading_dash_stays_text() {
         let recorder = Arc::new(Recorder::new());
-        actor(&recorder).type_text("-hello --json").unwrap();
+        actor(&recorder).type_text("-hello --json", None).unwrap();
         let calls = recorder.calls();
         assert_eq!(calls[0].args, vec!["-"]);
         assert_eq!(calls[0].stdin.as_deref(), Some(b"-hello --json".as_slice()));
@@ -1284,7 +1359,7 @@ mod tests {
     fn pressing_a_chord_sends_exactly_the_validated_argv() {
         let recorder = Arc::new(Recorder::new());
         actor(&recorder)
-            .press(&Chord::parse("alt+f4").unwrap())
+            .press(&Chord::parse("alt+f4").unwrap(), None)
             .unwrap();
         let calls = recorder.calls();
         assert_eq!(calls.len(), 1);
@@ -1296,7 +1371,7 @@ mod tests {
     fn a_failing_wtype_is_wtype_failed() {
         let recorder = Arc::new(Recorder::new());
         recorder.fail_wtype(false);
-        let err = actor(&recorder).type_text("hello").unwrap_err();
+        let err = actor(&recorder).type_text("hello", None).unwrap_err();
         assert_eq!(err.code(), ErrorCode::WtypeFailed);
         assert!(
             err.message().contains("no virtual keyboard"),
@@ -1307,7 +1382,7 @@ mod tests {
         let recorder = Arc::new(Recorder::new());
         recorder.fail_wtype(true);
         let err = actor(&recorder)
-            .press(&Chord::parse("escape").unwrap())
+            .press(&Chord::parse("escape").unwrap(), None)
             .unwrap_err();
         assert_eq!(err.code(), ErrorCode::WtypeFailed);
         assert!(err.message().contains("timed out"), "{}", err.message());
@@ -1364,11 +1439,12 @@ mod tests {
     fn pointer_moves_relative_and_clicks_inside_the_window() {
         let recorder = Arc::new(Recorder::new());
         recorder.set_window(
-            br#"{"mapped":true,"at":[100,200],"size":[1000,500],"class":"foot","title":"t"}"#,
+            br#"{"address":"0x7f","mapped":true,"at":[100,200],"size":[1000,500],"class":"foot","title":"t"}"#,
         );
         recorder.set_cursor("100, 200");
+        let approved = actor(&recorder).focused_window().unwrap();
         actor(&recorder)
-            .pointer("click", 0.5, 0.5, 0, 0, Some("foot"))
+            .pointer("click", 0.5, 0.5, 0, 0, Some(&approved))
             .unwrap();
         let calls = recorder.calls();
         let wlrctl: Vec<&Recorded> = calls
@@ -1383,10 +1459,18 @@ mod tests {
     #[test]
     fn pointer_refuses_a_changed_window_and_bad_points() {
         let recorder = Arc::new(Recorder::new());
+        recorder.set_window(
+            br#"{"address":"0x1","mapped":true,"at":[0,0],"size":[800,600],"class":"kitty","title":"t"}"#,
+        );
+        let approved = actor(&recorder).focused_window().unwrap();
+        recorder.set_window(
+            br#"{"address":"0x2","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"t"}"#,
+        );
         let error = actor(&recorder)
-            .pointer("click", 0.5, 0.5, 0, 0, Some("other"))
+            .pointer("click", 0.5, 0.5, 0, 0, Some(&approved))
             .unwrap_err();
-        assert_eq!(error.code(), ErrorCode::NoWindow);
+        assert_eq!(error.code(), ErrorCode::FocusMoved);
+        assert!(error.message().contains("nothing was clicked"));
         let error = actor(&recorder)
             .pointer("click", 1.5, 0.5, 0, 0, None)
             .unwrap_err();
@@ -1439,22 +1523,120 @@ mod tests {
     }
 
     #[test]
+    fn the_approved_window_is_read_again_before_typing_or_pressing() {
+        // Consent waits for a person; focus does not. The window the card named has to still be
+        // the focused one when `wtype` runs.
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_window(
+            br#"{"address":"0x1","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"t"}"#,
+        );
+        let typing = actor(&recorder);
+        let approved = typing.focused_window().unwrap();
+        assert_eq!(approved.address, "0x1");
+
+        // The person alt-tabbed while the card was open.
+        recorder.set_window(
+            br#"{"address":"0x2","mapped":true,"at":[0,0],"size":[800,600],"class":"firefox","title":"t"}"#,
+        );
+        let error = typing.type_text("hunter2", Some(&approved)).unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FocusMoved);
+        assert!(
+            error.message().contains("nothing was typed"),
+            "{}",
+            error.message()
+        );
+
+        let recorder_no_keys = Arc::new(Recorder::new());
+        recorder_no_keys.set_window(
+            br#"{"address":"0x1","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"t"}"#,
+        );
+        let keys = actor(&recorder_no_keys);
+        let approved = keys.focused_window().unwrap();
+        recorder_no_keys.set_window(
+            br#"{"address":"0x2","mapped":true,"at":[0,0],"size":[800,600],"class":"firefox","title":"t"}"#,
+        );
+        let error = keys
+            .press(&Chord::parse("ctrl+w").unwrap(), Some(&approved))
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FocusMoved);
+        assert!(error.message().contains("nothing was pressed"));
+
+        for rec in [&recorder, &recorder_no_keys] {
+            assert!(
+                rec.calls().iter().all(|call| call.program != "wtype"),
+                "nothing reached the keyboard: {:?}",
+                rec.calls()
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_window_of_the_same_app_is_not_the_approved_one() {
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_window(
+            br#"{"address":"0xaa","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"one"}"#,
+        );
+        let actor = actor(&recorder);
+        let approved = actor.focused_window().unwrap();
+        // Same app, other window: the class matches, the address does not.
+        recorder.set_window(
+            br#"{"address":"0xbb","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"two"}"#,
+        );
+        assert_eq!(
+            actor
+                .type_text("hello", Some(&approved))
+                .unwrap_err()
+                .code(),
+            ErrorCode::FocusMoved
+        );
+        // Hyprland's addresses are hex; case is not identity.
+        recorder.set_window(
+            br#"{"address":"0xAA","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"one"}"#,
+        );
+        actor.type_text("hello", Some(&approved)).unwrap();
+    }
+
+    #[test]
+    fn a_compositor_without_an_address_still_gets_the_class_check() {
+        let recorder = Arc::new(Recorder::new());
+        let actor = actor(&recorder);
+        let approved = actor.focused_window().unwrap();
+        assert_eq!(approved.address, "", "this fake window reports none");
+        // No address to compare: the class still has to match, so another app is refused…
+        recorder.set_window(
+            br#"{"mapped":true,"at":[0,0],"size":[100,100],"class":"kitty","title":"t"}"#,
+        );
+        assert_eq!(
+            actor
+                .type_text("hello", Some(&approved))
+                .unwrap_err()
+                .code(),
+            ErrorCode::FocusMoved
+        );
+        // …while the same app (this is all the compositor tells us) is allowed.
+        recorder.set_window(
+            br#"{"mapped":true,"at":[40,40],"size":[100,100],"class":"foot","title":"moved"}"#,
+        );
+        actor.type_text("hello", Some(&approved)).unwrap();
+    }
+
+    #[test]
     fn the_engine_itself_refuses_text_it_was_never_supposed_to_see() {
         // Defence in depth: the broker validates first, but the code that reaches the tool does
         // too, so no future caller can hand wtype or wl-copy something unchecked.
         let recorder = Arc::new(Recorder::new());
         let actor = actor(&recorder);
         assert_eq!(
-            actor.type_text("").unwrap_err().code(),
+            actor.type_text("", None).unwrap_err().code(),
             ErrorCode::NothingToType
         );
         assert_eq!(
-            actor.type_text("a\u{0}b").unwrap_err().code(),
+            actor.type_text("a\u{0}b", None).unwrap_err().code(),
             ErrorCode::InvalidParams
         );
         assert_eq!(
             actor
-                .type_text(&"x".repeat(MAX_TYPE_CHARS + 1))
+                .type_text(&"x".repeat(MAX_TYPE_CHARS + 1), None)
                 .unwrap_err()
                 .code(),
             ErrorCode::TooLarge
@@ -1479,5 +1661,20 @@ mod tests {
         let raw = format!(r#"{{"mapped":true,"class":"kitty","title":"{long}"}}"#);
         let window = parse_focused_window(raw.as_bytes()).unwrap();
         assert_eq!(window.title.chars().count(), crate::capture::MAX_TEXT_CHARS);
+    }
+
+    #[test]
+    fn a_hostile_address_is_clamped_and_stripped() {
+        let raw = format!(
+            r#"{{"mapped":true,"class":"kitty","address":"0x\u001b\u0000{}"}}"#,
+            "f".repeat(10_000)
+        );
+        let window = parse_focused_window(raw.as_bytes()).unwrap();
+        assert_eq!(
+            window.address.chars().count(),
+            crate::capture::MAX_ADDRESS_CHARS
+        );
+        assert!(!window.address.contains('\u{1b}') && !window.address.contains('\u{0}'));
+        assert!(window.address.starts_with("0x"), "{}", window.address);
     }
 }

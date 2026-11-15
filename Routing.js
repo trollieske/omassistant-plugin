@@ -210,6 +210,28 @@ function block(message) {
   return { action: "block", message: message }
 }
 
+// May a prompt go out on the model that is live right now?
+//
+// Choosing a route is one decision; arriving at it is another. A switch can fail
+// or time out, and afterwards the current model is whatever pi still had — which,
+// with "keep everything on this computer" on, may be a cloud model. The fallback
+// "use the current model" is therefore only allowed when that model is local.
+//
+// Returns "" when the prompt may go, or the sentence to show instead of sending.
+// `liveModel` is the catalog entry for the model that is actually in use (null or
+// undefined when it is not known yet — an unknown model is not a local one).
+function liveSendBlocked(localOnly, liveModel) {
+  if (!localOnly) return ""
+  if (!liveModel || !text(liveModel.id)) {
+    return "Keep everything on this computer is on, but no local model is active, so nothing was sent."
+  }
+  if (!isLocal(liveModel)) {
+    return "Keep everything on this computer is on, and " + displayName(liveModel)
+      + " is not a local model, so nothing was sent. Switch back to a local model and try again."
+  }
+  return ""
+}
+
 function use(tier, model, thinking, reason) {
   return {
     action: "use",

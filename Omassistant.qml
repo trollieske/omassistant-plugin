@@ -353,6 +353,20 @@ Item {
     if (!runtime.running) runtime.start()
   }
 
+  // The setup card's actions. Copying the command is deliberately an explicit
+  // user action; the plugin never runs an agent installer on its own.
+  function retryRuntime() {
+    runtime.retryNow()
+  }
+
+  function copySetupCommand() {
+    Quickshell.execDetached(["wl-copy", "pi --version"])
+  }
+
+  function openSetupDocs() {
+    Qt.openUrlExternally("https://pi.dev")
+  }
+
   // --- conversation ------------------------------------------------------
 
   function submit(text, image) {
@@ -1547,7 +1561,9 @@ Item {
       return root.askQuestion(question, image)
     }
     // The set_model path is tiny (~1 ms); the token keeps a late callback from
-    // a superseded switch out of the next question.
+    // a superseded switch out of the next question. A switch that fails must not
+    // fall back to "whatever is in use": in local-only that could be the cloud,
+    // so askQuestion() refuses it and says why. See Routing.liveSendBlocked().
     var token = "route-" + (root.serialRoute += 1)
     root.routeToken = token
     root.routeQuestion = question
@@ -1560,19 +1576,34 @@ Item {
       routeTimer.stop()
       root.routeQuestion = ""
       root.routeImage = null
-      if (!ok) {
-        root.appendNote("MODEL", "Could not switch to " + chosen.name + "; using the current model.", false)
-      } else {
+      if (ok) {
         root.lastRouteTier = chosen.tier
         root.lastRoute = chosen
+      } else if (!root.localOnly) {
+        root.appendNote("MODEL", "Could not switch to " + chosen.name + "; using the current model.", false)
       }
+      // In local-only the fallback is not ours to make: askQuestion() will
+      // refuse a cloud model with the reason instead of sending quietly.
       root.askQuestion(question, image)
     })
     return true
   }
 
+  // The one place a question leaves for a model. "Keep everything on this
+  // computer" is checked here and not only in chooseRoute(): a model switch that
+  // failed or timed out leaves pi on whatever model it had, and the cloud must not
+  // get the question and the screenshot just because the switch did not land.
+  function liveModel() {
+    return root.findModel(runtime.activeProvider, runtime.activeModelId)
+  }
+
   function askQuestion(question, image) {
     if (!root.busy) return false
+    var blocked = Routing.liveSendBlocked(root.localOnly, root.liveModel())
+    if (blocked.length) {
+      root.failQuestion(blocked, question, image)
+      return false
+    }
     if (!runtime.ask(question, image || null)) {
       root.failQuestion("The question could not be sent to the assistant.", question, image)
       return false
@@ -2705,7 +2736,8 @@ Item {
   }
 
   // A model switch is milliseconds; this is the "pi is wedged" escape, not a
-  // normal path. The question still goes out with the current model.
+  // normal path. Outside local-only the question goes out with the current model;
+  // in local-only askQuestion() refuses anything but a local model.
   Timer {
     id: routeTimer
     interval: 2500
@@ -2717,7 +2749,9 @@ Item {
       root.routeToken = ""
       root.routeQuestion = ""
       root.routeImage = null
-      root.appendNote("MODEL", "The model switch took too long; using the current model.", false)
+      if (!root.localOnly) {
+        root.appendNote("MODEL", "The model switch took too long; using the current model.", false)
+      }
       root.askQuestion(question, image)
     }
   }
@@ -3101,6 +3135,9 @@ Item {
       onCostsClosed: root.closeCosts()
       onCostsRefresh: root.refreshCosts()
       onSettingsDesktopChanged: function(on) { root.setDesktopWidget(on) }
+      onSetupRetry: root.retryRuntime()
+      onSetupCopy: root.copySetupCommand()
+      onSetupOpen: root.openSetupDocs()
       onStopRequested: root.stopRun("")
       onPermissionsRefresh: function() {
         if (!daemon.connected) root.ensureDaemon()

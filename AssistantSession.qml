@@ -124,6 +124,17 @@ QtObject {
     if (proc.running) proc.running = false
   }
 
+  // A person pressed Retry after a startup failure. Forget the old failure
+  // count and any fault text so the card returns to "connecting", not
+  // "offline", while the new child starts.
+  function retryNow() {
+    failures = 0
+    faultText = ""
+    lastStderr = ""
+    if (proc.running) restart()
+    else start()
+  }
+
   property bool intentionalStop: false
 
   // Rebuild the child when the configuration it was started with changed.
@@ -711,8 +722,11 @@ QtObject {
         root.stateChanged()
         return
       }
-      root.faultText = "The assistant is not answering yet. It will be restarted if nothing arrives."
-      root.stateChanged()
+      // A slow first start is not a fault. Omarchy's managed mise may be
+      // installing pi, and a restart here would interrupt that install. The
+      // exit path (missing pi, a failed exec) and the handshake still decide;
+      // the card says "connecting" in the meantime.
+      return
     }
   }
 }

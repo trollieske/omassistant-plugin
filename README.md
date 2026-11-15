@@ -76,8 +76,11 @@ instructions"; the broker still checks the grant. The model can ask; it cannot g
 - **Omarchy Quattro** with Hyprland and Quickshell. Wayland only; X11 is not supported.
 - **Rust 1.85 or newer** to build the broker (edition 2024). The build is local and user-level;
   nothing is installed system-wide. If you prefer a package, the same source is in `daemon/`.
-- **pi** from [pi.dev](https://pi.dev), with at least one provider signed in. Omassistant does not
-  ship a model and never stores a provider key.
+- **pi** with at least one provider signed in. On Omarchy Quattro, pi is part of the managed mise
+  tool set and installs itself on first use; run `pi --version` once. If you manage tools another
+  way, install pi from [pi.dev](https://pi.dev), then run `pi` once. Omassistant does not ship a
+  model and never stores a provider key. If pi cannot start, the overlay shows a setup card with
+  the command, a link to pi.dev and a Retry button; it never installs an agent silently.
 - **Desktop tools** on `PATH`: `grim` (capture), `hyprctl` (Hyprland), `wtype` (typing and keys),
   `wl-copy` and `wl-paste` (clipboard), `curl` (loopback local-model discovery), and the usual
   Omarchy helpers (`omarchy-launch-*`, `omarchy-capture-screenshot`, etc.).
@@ -132,8 +135,14 @@ by name; use another client only after editing the fixed table in `daemon/src/ac
 Set up **voxtype** with Omarchy's own dictation setup if you want `Ctrl+D`; Omassistant reads
 voxtype's state and never bundles or downloads a whisper model.
 
-Install **pi** from [pi.dev](https://pi.dev), then run `pi` once and sign in to a provider. Any
-provider or local model that pi can use will appear in Omassistant's Settings sheet.
+Set up **pi** with at least one provider. On Omarchy Quattro, run `pi --version` once: the managed
+mise configuration installs it lazily and keeps it updated. If you use another setup, install pi
+from [pi.dev](https://pi.dev) and run `pi` once. Any provider or local model that pi can use will
+appear in Omassistant's Settings sheet.
+
+The overlay is honest when pi is missing: it opens a **setup card** with the `pi --version`
+command, a link to pi.dev, a copy button and **Retry**. It does not run a network installer for
+you. A first start can be slow while mise fetches pi; the card says so instead of showing a fault.
 
 ### 4. Bind the keys and reload the shell
 
@@ -225,6 +234,13 @@ How it behaves:
   call per confirmation unless you grant a standing grant from the sheet.
 - **Standing grants expire.** The sheet offers 5, 10, 15, 20, 25, 30 or 60 minutes, per capability,
   plus ALLOW EVERYTHING and REVOKE EVERYTHING. A countdown is visible while a grant is live.
+- **An approval names a window, and that window is checked again.** Between the question and your
+  answer focus can move: the card does not hold it. So the broker reads the focused window again
+  immediately before a capture, a keystroke, some typing or a click, and compares the app class and
+  the window's compositor address with what you approved. If they differ, nothing is captured,
+  typed or pressed; the call fails with `focus_moved` and the audit line says which window was
+  approved. A window that only moved or resized is still the same window, and is captured where it
+  is now.
 - **The broker re-checks every call.** A changed window, an expired grant or a stopped run fails
   closed. The model cannot widen a grant, and no observed text is treated as an instruction.
 - **The card steps aside, not away.** While an action runs, the sidebar releases keyboard focus so
@@ -259,6 +275,9 @@ A switch is a single `set_model` RPC call: no restart, no lost session. The rout
 pure function in `Routing.js`, so it can be read and tested without the model. It routes short
 questions to Fast, complex or action-shaped requests to Best, keeps follow-ups on the previous tier,
 sends images only to a vision model, and blocks an image or a cloud request when local-only is on.
+That block is checked again at the moment a question is sent, not only when the route is chosen: if
+a switch to the local model fails or times out, the question and its screenshot are **not** sent on
+the model that happens to be loaded. The card says so, keeps your draft, and waits for you.
 
 Local discovery probes only loopback addresses: Ollama on `127.0.0.1:11434`, LM Studio on
 `127.0.0.1:1234`, llama.cpp on `127.0.0.1:8080`. If you choose *Find local models*, Omassistant
@@ -334,19 +353,23 @@ and `omassistantctl ping --json`. If you just built the broker, make sure `~/.lo
 `PATH` that the shell was started with, then `omarchy-restart-shell`. The plugin starts the broker
 on demand; there is no service to enable.
 
-**The overlay opens without pi.** Check `command -v pi` and that `pi` works in a terminal. The card
-starts pi with `--mode rpc` in its scratch workspace; a pi that needs an interactive login will not
-work until you have signed in once. The Settings sheet only lists what pi reports.
+**The overlay opens without pi.** The card should show its setup state rather than a bare OFFLINE
+error. The Omarchy route is `pi --version` once (mise installs the managed tool); otherwise install
+pi from pi.dev. Then sign in by running `pi` once in a terminal. The card starts pi with
+`--mode rpc` in its scratch workspace; a pi that needs an interactive login will not work until
+you have done that. The Settings sheet only lists what pi reports.
 
 **A look is black or shows the wrong window.** The card blanks and steps aside during a capture;
 the capture is the focused window (or the focused monitor). Focus the window first, then use
 `Ctrl+O` or `/look`. If the window is on another monitor, use the monitor target. Permissions must
-still be live.
+still be live. If focus moved while you were answering the prompt, the call fails with
+`focus_moved` instead of capturing the window that replaced it: look again, in the window you meant.
 
 **Keys go to the card instead of the app.** The card should release keyboard focus while a granted
 action runs. If a standing key grant is live and the card is focused, click the app window first or
 press `Esc` and reopen. A key approval is bound to one window and 60 seconds; it cannot follow you
-to another app.
+to another app, and if focus moved before the keys went out the call fails with `focus_moved` and
+nothing is pressed.
 
 **Pointer does nothing.** Pointer control needs `wlrctl` (Wayland virtual pointer). If it is not
 installed, the permission is offered but calls fail closed. Install `wlrctl` from the AUR, restart

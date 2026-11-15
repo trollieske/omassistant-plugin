@@ -26,6 +26,20 @@ Item {
   property bool waiting: false
   property string runtimeFault: ""
   property string modelLabel: ""
+  // The runtime stopped for good and the person has to fix something outside
+  // the chat (usually: pi is missing, or pi has no usable model). A slow first
+  // start is not a setup problem; the card says "connecting" while mise may be
+  // installing pi.
+  readonly property bool setupMode: root.runtimeFault.length > 0
+    && !root.runtimeLive && !root.runtimeStarting && !root.busy
+  readonly property bool setupMissing: root.setupMode
+    && /(failed to execute pi|no such file|command not found|not installed|did not start.*installed|could not be started)/i
+      .test(root.runtimeFault)
+  readonly property string setupTitle: root.setupMissing
+    ? "Omassistant needs pi" : "The assistant could not start"
+  readonly property string setupBody: root.setupMissing
+    ? "pi is the agent runtime that talks to your model. It is not bundled with Omassistant. Omarchy manages it through mise; if it is missing, install it once and come back."
+    : "pi is the agent runtime. It started but did not become usable. Check the message below, then fix the model or provider and try again."
   // The session index from the host: file/title/when/turns/current.
   property var historyModel: null
   property bool historyReady: true
@@ -100,6 +114,9 @@ Item {
   signal costsRequested()
   signal costsClosed()
   signal costsRefresh()
+  signal setupRetry()
+  signal setupCopy()
+  signal setupOpen()
 
   property color surface: Commons.Color.menu.background
   property color foreground: Commons.Color.menu.text
@@ -236,9 +253,17 @@ Item {
     })
   }
 
+  onSetupModeChanged: {
+    if (root.settingsOpen || root.permissionsOpen || root.costsOpen) return
+    Qt.callLater(function() { root.focusComposer() })
+  }
+
   function focusComposer() {
     if (root.active && !root.settingsOpen && !root.permissionsOpen && !root.costsOpen
-        && !root.actingFocus) input.forceActiveFocus()
+        && !root.actingFocus) {
+      if (root.setupMode) setupPane.forceActiveFocus()
+      else input.forceActiveFocus()
+    }
   }
 
   function setDraft(text) {
@@ -521,13 +546,229 @@ Item {
         anchors.bottomMargin: root.sectionGap
         clip: true
 
+        // A startup failure is not an empty chat with a red word. This is the
+        // one place where the card explains a required external thing (pi) and
+        // gives the person the command, the link and a retry, without silently
+        // installing an agent runtime on their behalf.
+        Item {
+          id: setupPane
+          objectName: "omassistantSetup"
+          anchors.fill: parent
+          visible: root.setupMode
+          focus: visible
+
+          Keys.onPressed: function(event) {
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter
+                || event.key === Qt.Key_R) {
+              root.setupRetry()
+              event.accepted = true
+            } else if (event.key === Qt.Key_C) {
+              root.setupCopy()
+              event.accepted = true
+            } else if (event.key === Qt.Key_O) {
+              root.setupOpen()
+              event.accepted = true
+            } else if (event.key === Qt.Key_S) {
+              root.settingsRequested()
+              event.accepted = true
+            } else if (event.key === Qt.Key_Escape) {
+              root.dismissed()
+              event.accepted = true
+            }
+          }
+
+          Column {
+            x: root.gutter
+            width: parent.width - root.gutter * 2
+            anchors.top: parent.top
+            anchors.topMargin: Style.space(4)
+            spacing: Style.space(11)
+
+            Text {
+              textFormat: Text.PlainText
+              text: "SETUP"
+              color: root.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.6
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.setupTitle
+              wrapMode: Text.Wrap
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.setupBody
+              wrapMode: Text.Wrap
+              color: root.textSecondary
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              lineHeightMode: Text.FixedHeight
+              lineHeight: Style.space(17)
+            }
+
+            Text {
+              visible: root.setupMissing
+              textFormat: Text.PlainText
+              text: "ON OMARCHY  ·  MISE"
+              color: root.textTertiary
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+            }
+
+            Rectangle {
+              visible: root.setupMissing
+              width: parent.width
+              height: setupCommandText.implicitHeight + Style.spacing.controlPaddingY * 2
+              color: "transparent"
+              border.width: Math.max(1, Style.space(1))
+              border.color: Commons.Util.alpha(root.border, 0.85)
+              radius: root.cornerRadius
+
+              Text {
+                id: setupCommandText
+                anchors.left: parent.left
+                anchors.leftMargin: Style.spacing.controlPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "pi --version"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+              }
+
+              Text {
+                id: setupCopyText
+                anchors.right: parent.right
+                anchors.rightMargin: Style.spacing.controlPaddingX
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "COPY"
+                color: setupCopyMouse.containsMouse ? root.accent : root.textTertiary
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+
+                MouseArea {
+                  id: setupCopyMouse
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(6)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setupCopy()
+                }
+              }
+            }
+
+            Text {
+              visible: root.setupMissing
+              width: parent.width
+              textFormat: Text.PlainText
+              text: "Then run `pi` once in a terminal to sign in, and choose a model in Settings."
+              wrapMode: Text.Wrap
+              color: root.textSecondary
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              lineHeightMode: Text.FixedHeight
+              lineHeight: Style.space(17)
+            }
+
+            Text {
+              width: parent.width
+              visible: root.runtimeFault.length > 0
+              textFormat: Text.PlainText
+              text: root.runtimeFault
+              wrapMode: Text.Wrap
+              color: root.urgent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              lineHeightMode: Text.FixedHeight
+              lineHeight: Style.space(14)
+            }
+
+            Row {
+              spacing: Style.space(18)
+
+              Text {
+                textFormat: Text.PlainText
+                text: "RETRY"
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+
+                MouseArea {
+                  id: setupRetryMouse
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(6)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setupRetry()
+                }
+              }
+
+              Text {
+                visible: root.setupMissing
+                textFormat: Text.PlainText
+                text: "OPEN PI.DEV"
+                color: setupOpenMouse.containsMouse ? root.accent : root.textSecondary
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+
+                MouseArea {
+                  id: setupOpenMouse
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(6)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.setupOpen()
+                }
+              }
+
+              Text {
+                textFormat: Text.PlainText
+                text: "SETTINGS"
+                color: setupSettingsMouse.containsMouse ? root.accent : root.textSecondary
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                font.letterSpacing: 1.0
+
+                MouseArea {
+                  id: setupSettingsMouse
+                  anchors.fill: parent
+                  anchors.margins: -Style.space(6)
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.settingsRequested()
+                }
+              }
+            }
+          }
+        }
+
         // The empty state is a line of copy, not a splash page: the brand is in
         // the header, and the input says "ask anything" already.
         Column {
           width: parent.width - root.gutter
           x: root.gutter
           anchors.verticalCenter: parent.verticalCenter
-          visible: root.bodyContentHeight === 0 && !root.historyMode && root.historyReady
+          visible: root.bodyContentHeight === 0 && !root.historyMode && root.historyReady && !root.setupMode
           spacing: Style.space(6)
 
           Text {
@@ -546,6 +787,17 @@ Item {
             color: root.textSecondary
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+          }
+
+          Text {
+            width: parent.width
+            visible: root.runtimeStarting
+            wrapMode: Text.Wrap
+            textFormat: Text.PlainText
+            text: "Starting pi… first run may install it through Omarchy's mise."
+            color: root.textTertiary
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           Row {
@@ -608,7 +860,7 @@ Item {
         Flickable {
           id: scroller
           anchors.fill: parent
-          visible: root.bodyContentHeight > 0 && !root.historyMode
+          visible: root.bodyContentHeight > 0 && !root.historyMode && !root.setupMode
           clip: true
           boundsBehavior: Flickable.StopAtBounds
           contentWidth: width
@@ -742,7 +994,7 @@ Item {
           anchors.left: parent.left
           anchors.right: parent.right
           height: Style.space(16)
-          visible: !root.historyMode && scroller.contentY > 1
+          visible: !root.setupMode && !root.historyMode && scroller.contentY > 1
           gradient: Gradient {
             GradientStop { position: 0.0; color: root.surface }
             GradientStop { position: 1.0; color: "transparent" }
@@ -754,7 +1006,7 @@ Item {
           anchors.left: parent.left
           anchors.right: parent.right
           height: Style.space(16)
-          visible: !root.historyMode && scroller.contentY + scroller.height < scroller.contentHeight - 1
+          visible: !root.setupMode && !root.historyMode && scroller.contentY + scroller.height < scroller.contentHeight - 1
           gradient: Gradient {
             GradientStop { position: 0.0; color: "transparent" }
             GradientStop { position: 1.0; color: root.surface }
@@ -766,7 +1018,7 @@ Item {
         Text {
           anchors.top: parent.top
           anchors.left: parent.left
-          visible: !root.historyReady && !root.historyMode
+          visible: !root.historyReady && !root.historyMode && !root.setupMode
           textFormat: Text.PlainText
           text: "restoring conversation…"
           color: root.textTertiary
@@ -779,7 +1031,7 @@ Item {
         ListView {
           id: historyList
           anchors.fill: parent
-          visible: root.historyMode
+          visible: root.historyMode && !root.setupMode
           clip: true
           model: root.historyModel
           spacing: Style.space(2)
@@ -843,7 +1095,7 @@ Item {
         Text {
           anchors.top: parent.top
           anchors.left: parent.left
-          visible: root.historyMode && (!root.historyModel || root.historyModel.count === 0)
+          visible: root.historyMode && !root.setupMode && (!root.historyModel || root.historyModel.count === 0)
           textFormat: Text.PlainText
           text: "no earlier conversations"
           color: root.textTertiary
@@ -854,6 +1106,7 @@ Item {
 
       PanelSeparator {
         id: composerRule
+        visible: !root.setupMode
         anchors.bottom: footer.top
         anchors.bottomMargin: root.sectionGap
         anchors.left: parent.left
@@ -868,11 +1121,12 @@ Item {
 
       Item {
         id: composer
+        visible: !root.setupMode
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: composerRule.top
         anchors.bottomMargin: Style.spacing.md
-        height: root.composerHeight
+        height: root.setupMode ? 0 : root.composerHeight
 
         // Consent is a mode of the card, not a dialog: one row, one decision,
         // the same keys as everything else (Enter allows, Esc backs out).
@@ -1401,7 +1655,7 @@ Item {
           text: root.modelName
           // The model is a whisper, not a status: give way to the key hints
           // rather than colliding with them.
-          visible: text.length > 0
+          visible: !root.setupMode && text.length > 0
             && hintMetrics.advanceWidth + implicitWidth + Style.space(16) < parent.width
           color: root.textTertiary
           font.family: root.fontFamily
@@ -1497,6 +1751,9 @@ Item {
     && root.runtimeLive && !root.grantsOn
 
   readonly property string footerHint: {
+    if (root.setupMode) return root.setupMissing
+      ? "R RETRY  ·  C COPY  ·  O PI.DEV  ·  S SETTINGS"
+      : "R RETRY  ·  S SETTINGS  ·  ESC"
     if (root.historyMode) return "↑↓ CHOOSE  ·  ENTER RESUME  ·  ESC BACK"
     if (root.busy) return "WORKING  ·  STOP  ·  SUPER+ALT+ESC  ·  ESC"
     var base = "ENTER  ·  ESC"
@@ -1513,6 +1770,7 @@ Item {
   }
 
   readonly property color statusColor: {
+    if (root.setupMode) return root.accent
     if (root.runtimeFault.length > 0) return root.urgent
     if (root.actionMode || root.brokerConfirm || root.brokerActing) return root.accent
     if (root.consentMode || root.looking || root.lookState === "attached") return root.accent
@@ -1524,6 +1782,7 @@ Item {
   }
 
   readonly property string statusLabel: {
+    if (root.setupMode) return "SETUP"
     if (root.runtimeFault.length > 0) return "OFFLINE"
     if (root.brokerConfirm) return "CONFIRM ?"
     if (root.actionConfirm) return "ACT ?"

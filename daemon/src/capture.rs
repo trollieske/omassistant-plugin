@@ -107,12 +107,33 @@ impl Rect {
 pub struct WindowFacts {
     /// The application class (never logged as a title).
     pub class: String,
+    /// The compositor's address for this window (`0x…`), or empty when it reports none. The exact
+    /// identity of the window a confirmation named; never logged.
+    pub address: String,
     /// The window title. Goes to the caller, never to the audit log.
     pub title: String,
     /// The window rectangle.
     pub rect: Rect,
     /// The index of the monitor the window is on, when the compositor says.
     pub monitor: Option<usize>,
+}
+
+impl WindowFacts {
+    /// Is this still the same window as `other`?
+    ///
+    /// The class is the app the person approved; the address narrows it to the instance when both
+    /// reads have one, so a second window of the same app is never captured under the first one's
+    /// approval.
+    #[must_use]
+    pub fn same_window(&self, other: &Self) -> bool {
+        if self.class != other.class {
+            return false;
+        }
+        if self.address.is_empty() || other.address.is_empty() {
+            return true;
+        }
+        self.address.eq_ignore_ascii_case(&other.address)
+    }
 }
 
 /// What the compositor says about one monitor.
@@ -485,6 +506,7 @@ pub fn parse_active_window(stdout: &[u8]) -> Result<WindowFacts, ApiError> {
     let height = pair_component_u32(size, 1, "size")?;
     let rect = validate_rect(x, y, width, height)?;
     let class = clamp_text(string_field(object.get("class")));
+    let address = clamp_address(string_field(object.get("address")));
     let title = clamp_text(string_field(object.get("title")));
     let monitor = object
         .get("monitor")
@@ -493,6 +515,7 @@ pub fn parse_active_window(stdout: &[u8]) -> Result<WindowFacts, ApiError> {
         .filter(|index| *index <= 64);
     Ok(WindowFacts {
         class,
+        address,
         title,
         rect,
         monitor,
@@ -582,6 +605,18 @@ fn string_field(value: Option<&Value>) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// The longest window address this daemon will carry. Hyprland sends `0x` and a pointer-sized hex
+/// number; the cap exists only because the field comes from the compositor.
+pub const MAX_ADDRESS_CHARS: usize = 64;
+
+/// Keep the first `MAX_ADDRESS_CHARS` characters of a window address, without control characters.
+pub(crate) fn clamp_address(text: String) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control())
+        .take(MAX_ADDRESS_CHARS)
+        .collect()
 }
 
 /// Keep the first `MAX_TEXT_CHARS` characters, on a character boundary.
