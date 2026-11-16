@@ -58,7 +58,7 @@ pub const ACT_LAUNCH: Capability = Capability {
 /// `shell.run`: run one of a fixed set of desktop actions.
 pub const SHELL_RUN: Capability = Capability {
     name: "shell.run",
-    description: "Run a named desktop action (screenshot, lock, volume, brightness, workspace, layout)",
+    description: "Run a named desktop action (lock, volume, brightness, workspace, layout)",
 };
 
 /// Everything this daemon implements. The browser and mail are not here.
@@ -118,7 +118,7 @@ mod tests {
         let capability = find("shell.run").unwrap();
         assert_eq!(
             capability.description,
-            "Run a named desktop action (screenshot, lock, volume, brightness, workspace, layout)"
+            "Run a named desktop action (lock, volume, brightness, workspace, layout)"
         );
 
         assert!(find("").is_none());

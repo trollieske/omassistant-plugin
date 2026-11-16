@@ -31,6 +31,9 @@ use std::path::Path;
 /// The longest desktop entry id this daemon will accept.
 pub const MAX_DESKTOP_ID_CHARS: usize = 160;
 
+/// Omarchy's special workspace for minimized windows (`omarchy-hyprland-window-minimize`).
+pub const MINIMIZED_WORKSPACE: &str = "special:minimized";
+
 /// Desktop ids are file names, not paths: letters, digits and the separators
 /// real ids use, ending in `.desktop`.
 const DESKTOP_ID_SUFFIX: &str = ".desktop";
@@ -122,21 +125,28 @@ impl LaunchOverrides {
     }
 }
 
-/// A desktop id made readable for a confirmation: `io.github.billsecond.mailcraft.desktop`
-/// becomes `Mailcraft`. The confirmation should name the app, not a file name.
+/// The app's own name from a desktop id: `io.github.billsecond.mailcraft.desktop`
+/// and `MailCraft.desktop` become the string that matches the window class.
 #[must_use]
-pub fn display_name(id: &str) -> String {
+pub fn app_name(id: &str) -> String {
     let stem = id.strip_suffix(DESKTOP_ID_SUFFIX).unwrap_or(id);
     // Reverse-DNS ids end in the app's own name; keep that last component.
     let last = stem.rsplit('.').next().unwrap_or(stem);
-    let label: String = last
+    one_line(last, 40)
+}
+
+/// A desktop id made readable for a confirmation: `io.github.billsecond.mailcraft.desktop`
+/// becomes `mailcraft`. The confirmation should name the app, not a file name.
+#[must_use]
+pub fn display_name(id: &str) -> String {
+    let label: String = app_name(id)
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == ' ')
         .collect();
     if label.is_empty() {
-        one_line(stem, 40)
+        one_line(id, 40)
     } else {
-        one_line(&label, 40)
+        label
     }
 }
 
@@ -228,6 +238,12 @@ mod tests {
         );
         assert_eq!(display_name("HEY.desktop"), "HEY");
         assert_eq!(display_name("thunderbird.desktop"), "thunderbird");
+        // The raw stem is what gets matched against the window class.
+        assert_eq!(
+            app_name("io.github.billsecond.mailcraft.desktop"),
+            "mailcraft"
+        );
+        assert_eq!(app_name("HEY.desktop"), "HEY");
     }
 
     #[test]

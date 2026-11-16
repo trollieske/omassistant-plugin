@@ -671,7 +671,13 @@ impl Broker {
 
         match &app {
             LaunchApp::Command => self.actor.launch(action)?,
-            LaunchApp::Desktop(id) => self.actor.launch_desktop(id)?,
+            LaunchApp::Desktop(id) => {
+                self.actor.launch_desktop(id)?;
+                // "Open the mail app" has to mean the window is in front of the person.
+                // gtk-launch activates an app that is already running, and a minimized
+                // one stays on Omarchy's hidden workspace until someone fetches it.
+                self.actor.raise_app(&crate::launch::app_name(id))?;
+            }
         }
         self.charge(&grant, caps::ACT_LAUNCH.name, now_unix)?;
         Ok(json!({

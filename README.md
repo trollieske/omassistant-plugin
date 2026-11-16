@@ -22,9 +22,10 @@ each as its own grant, each audited, all revocable.
 - **Look at the current window.** `Ctrl+O` or `/look` captures the focused window or monitor after
   a visible consent prompt. The card blanks while the shot is taken so the overlay is not in it.
 - **Act, with a grant for each kind of action.** Type, press keys, click and scroll, read/write the
-  clipboard, launch an app, or run a named desktop action. `shell.run` is a fixed table (screenshot,
-  lock, volume, brightness, workspace, layout, fullscreen/maximize/restore); there is no arbitrary
-  shell and no caller-supplied program.
+  clipboard, launch an app, or run a named desktop action. `shell.run` is a fixed table (lock,
+  volume, brightness, workspace, layout, fullscreen/maximize/restore); there is no arbitrary shell
+  and no caller-supplied program. Looking at the screen is `observe.screen`, not a screenshot
+  action: the capture is brokered and audited instead of opening a picker.
 - **Remember the conversation.** Each conversation is a pi session under
   `~/.local/state/omassistant/pi-sessions/`. The newest session is resumed on shell start; `Ctrl+H`
   switches between them; the transcript is rebuilt from pi's own messages.
@@ -84,8 +85,9 @@ instructions"; the broker still checks the grant. The model can ask; it cannot g
   model and never stores a provider key. If pi cannot start, the overlay shows a setup card with
   the command, a link to pi.dev and a Retry button; it never installs an agent silently.
 - **Desktop tools** on `PATH`: `grim` (capture), `hyprctl` (Hyprland), `wtype` (typing and keys),
-  `wl-copy` and `wl-paste` (clipboard), `curl` (loopback local-model discovery), and the usual
-  Omarchy helpers (`omarchy-launch-*`, `omarchy-capture-screenshot`, etc.).
+  `wl-copy` and `wl-paste` (clipboard), `gtk-launch` and `xdg-mime` (opening your apps),
+  `curl` (loopback local-model discovery), and the usual Omarchy helpers
+  (`omarchy-launch-*`, `omarchy-audio-output-volume`, `omarchy-brightness-display`).
 - **Optional:** ImageMagick (`magick`) for smaller screenshots; `wlrctl` for pointer control;
   one of the dictation backends Omarchy offers (voxtype, Superwhisper, Hex); any mail app the
   desktop can open for `mailto:` links (see below).
@@ -236,9 +238,10 @@ Seven capabilities, each a separate grant:
 - `act.keys` — press keys and shortcuts in the focused window
 - `act.pointer` — click, double-click, right-click, middle-click, scroll or move inside the focused window
 - `act.clipboard` — read or write the clipboard
-- `act.launch` — open your browser, terminal, editor or mail app when it is not already open
-- `shell.run` — a fixed table of desktop actions (screenshot, lock, volume, brightness, workspace,
-  layout, fullscreen/maximize/restore)
+- `act.launch` — open your browser, terminal, editor or mail app, and bring its window to the
+  front (restoring it if it was minimized)
+- `shell.run` — a fixed table of desktop actions (lock, volume, brightness, workspace, layout,
+  fullscreen/maximize/restore)
 
 How it behaves:
 

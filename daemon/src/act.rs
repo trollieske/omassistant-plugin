@@ -109,8 +109,14 @@ pub fn launch_action(name: &str) -> Result<&'static str, ApiError> {
 /// Named desktop actions for `shell.run`. Each name is one fixed program with fixed
 /// arguments — no caller text, no paths, no shell. Interactive Omarchy helpers
 /// (region selection, OCR capture) are deliberately absent: they wait for a person.
+///
+/// `screenshot` used to be here and was the exception that proved the rule:
+/// `omarchy-capture-screenshot` with no target opens omasnap's region/window
+/// picker and waits for someone to drag, so the broker timed it out and killed
+/// the overlay — a stray selection UI over the desktop and an `action_failed` for
+/// the model. Looking at the screen is `observe.screen`, which is brokered,
+/// audited and returns an image.
 pub const SHELL_ACTIONS: &[(&str, &[&str])] = &[
-    ("screenshot", &["omarchy-capture-screenshot"]),
     ("lock", &["omarchy-system-lock"]),
     ("volume-up", &["omarchy-audio-output-volume", "raise"]),
     ("volume-down", &["omarchy-audio-output-volume", "lower"]),
@@ -169,7 +175,6 @@ pub const SHELL_ACTIONS: &[(&str, &[&str])] = &[
 /// A human sentence for the confirmation and the model.
 pub fn shell_action_label(name: &str) -> &'static str {
     match name {
-        "screenshot" => "Take a screenshot",
         "lock" => "Lock the screen",
         "volume-up" => "Turn the volume up",
         "volume-down" => "Turn the volume down",
@@ -343,6 +348,116 @@ impl Actor {
     pub fn launch_desktop(&self, id: &str) -> Result<(), ApiError> {
         let id = crate::launch::validate_desktop_id(id)?;
         self.spawn("gtk-launch", &[&id], &id)
+    }
+
+    /// Bring an app's window to the front, restoring it if it was minimized.
+    ///
+    /// "Open the mail app" means the window is in front of you, not merely that a
+    /// process exists: gtk-launch activates an already-running app, and Hyprland
+    /// leaves that window wherever it was — usually Omarchy's
+    /// `special:minimized`, where nobody can see it. This mirrors what the dock
+    /// does when a minimized app is clicked.
+    ///
+    /// Best-effort: a launch that has not mapped its window yet is not a failure,
+    /// and an app whose window cannot be found is simply left alone.
+    pub fn raise_app(&self, pattern: &str) -> Result<(), ApiError> {
+        let Some((address, minimized)) = self.find_window(pattern)? else {
+            return Ok(());
+        };
+        let target = format!("window = \"address:{address}\"");
+        if minimized {
+            let workspace = self.active_workspace()?;
+            self.dispatch(&format!(
+                "hl.dsp.window.set_prop({{ prop = \"no_anim\", value = \"1\", {target} }})"
+            ));
+            self.dispatch(&format!(
+                "hl.dsp.window.move({{ workspace = \"{workspace}\", {target} }})"
+            ));
+            self.dispatch(&format!(
+                "hl.dsp.window.set_prop({{ prop = \"no_anim\", value = \"unset\", {target} }})"
+            ));
+        }
+        self.dispatch(&format!("hl.dsp.focus({{ {target} }})"));
+        self.dispatch(&format!(
+            "hl.dsp.window.alter_zorder({{ mode = \"top\", {target} }})"
+        ));
+        Ok(())
+    }
+
+    /// The window whose class matches `pattern` (case-insensitive), the most
+    /// recently focused one, and whether it sits on the minimized workspace.
+    fn find_window(&self, pattern: &str) -> Result<Option<(String, bool)>, ApiError> {
+        let output = self
+            .runner
+            .run("hyprctl", &["-j", "clients"], ACT_TIMEOUT)?;
+        if !output.success() {
+            return Ok(None);
+        }
+        let Ok(serde_json::Value::Array(clients)) = serde_json::from_slice(&output.stdout) else {
+            return Ok(None);
+        };
+        let needle = pattern.to_ascii_lowercase();
+        let mut best: Option<(i64, String, bool)> = None;
+        for client in clients {
+            let class = client
+                .get("class")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !class.contains(&needle) {
+                continue;
+            }
+            let Some(address) = client.get("address").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            // A lower focus history is more recent; the compositor uses 0 for the focused one.
+            let history = client
+                .get("focusHistoryID")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(i64::MAX);
+            let workspace = client
+                .get("workspace")
+                .and_then(|workspace| workspace.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let minimized = workspace == crate::launch::MINIMIZED_WORKSPACE;
+            if best.as_ref().is_none_or(|(seen, _, _)| history < *seen) {
+                best = Some((history, address.to_string(), minimized));
+            }
+        }
+        Ok(best.map(|(_, address, minimized)| (address, minimized)))
+    }
+
+    /// The focused monitor's active workspace id, as a string for a dispatcher.
+    fn active_workspace(&self) -> Result<String, ApiError> {
+        let output = self
+            .runner
+            .run("hyprctl", &["-j", "activeworkspace"], ACT_TIMEOUT)?;
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+            return Err(ApiError::new(
+                ErrorCode::ActionFailed,
+                "the compositor did not describe the active workspace",
+            ));
+        };
+        value
+            .get("id")
+            .and_then(serde_json::Value::as_i64)
+            .map(|id| id.to_string())
+            .filter(|id| id != "0")
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::ActionFailed,
+                    "there is no active workspace to restore the window onto",
+                )
+            })
+    }
+
+    /// One compositor dispatch; failures are not fatal (a window can vanish
+    /// between the listing and the call).
+    fn dispatch(&self, expression: &str) {
+        let _ = self
+            .runner
+            .run("hyprctl", &["dispatch", expression], ACT_TIMEOUT);
     }
 
     /// The desktop's own handler for `mailto:` links, if one is registered.
@@ -1038,6 +1153,10 @@ mod tests {
         paste_fails: Mutex<bool>,
         /// What `xdg-mime query default x-scheme-handler/mailto` answers.
         mail_handler: Mutex<String>,
+        /// What `hyprctl -j clients` answers.
+        clients: Mutex<Vec<u8>>,
+        /// What `hyprctl -j activeworkspace` answers.
+        workspace: Mutex<Vec<u8>>,
     }
 
     impl Recorder {
@@ -1048,6 +1167,8 @@ mod tests {
                         .to_vec(),
                 ),
                 cursor: Mutex::new("0, 0".to_string()),
+                clients: Mutex::new(b"[]".to_vec()),
+                workspace: Mutex::new(br#"{"id":3}"#.to_vec()),
                 ..Self::default()
             }
         }
@@ -1066,6 +1187,21 @@ mod tests {
 
         fn set_mail_handler(&self, handler: &str) {
             *self.mail_handler.lock().unwrap() = handler.to_string();
+        }
+
+        fn set_clients(&self, json: &str) {
+            *self.clients.lock().unwrap() = json.as_bytes().to_vec();
+        }
+
+        fn dispatches(&self) -> Vec<String> {
+            self.calls()
+                .into_iter()
+                .filter(|call| {
+                    call.program == "hyprctl"
+                        && call.args.first().map(String::as_str) == Some("dispatch")
+                })
+                .filter_map(|call| call.args.get(1).cloned())
+                .collect()
         }
 
         fn fail_wtype(&self, timed_out: bool) {
@@ -1095,6 +1231,11 @@ mod tests {
                 "hyprctl" if args == ["cursorpos"] => {
                     ok(self.cursor.lock().unwrap().clone().into_bytes())
                 }
+                "hyprctl" if args == ["-j", "clients"] => ok(self.clients.lock().unwrap().clone()),
+                "hyprctl" if args == ["-j", "activeworkspace"] => {
+                    ok(self.workspace.lock().unwrap().clone())
+                }
+                "hyprctl" if args.first() == Some(&"dispatch") => ok(Vec::new()),
                 "hyprctl" => CommandOutput {
                     status: Some(0),
                     stdout: self.window.lock().unwrap().clone(),
@@ -1237,6 +1378,59 @@ mod tests {
             assert!(actor(&recorder).launch_desktop(bad).is_err(), "{bad}");
             assert!(recorder.calls().is_empty(), "{bad} reached a tool");
         }
+    }
+
+    #[test]
+    fn a_launch_brings_the_window_forward_and_out_of_the_minimized_workspace() {
+        let recorder = Arc::new(Recorder::new());
+        // A MailCraft window that is minimized and not focused.
+        recorder.set_clients(
+            r#"[
+              {"address":"0xaaa","class":"foot","workspace":{"name":"1"},"focusHistoryID":0},
+              {"address":"0xbbb","class":"io.github.billsecond.mailcraft",
+               "workspace":{"name":"special:minimized"},"focusHistoryID":2}
+            ]"#,
+        );
+        actor(&recorder).raise_app("mailcraft").unwrap();
+        let dispatches = recorder.dispatches();
+        assert!(
+            dispatches
+                .iter()
+                .any(|call| call.contains("hl.dsp.window.move")
+                    && call.contains("workspace = \"3\"")
+                    && call.contains("address:0xbbb")),
+            "a minimized window comes back to the active workspace: {dispatches:?}"
+        );
+        assert!(
+            dispatches
+                .iter()
+                .any(|call| call.contains("hl.dsp.focus") && call.contains("address:0xbbb")),
+            "and it is focused: {dispatches:?}"
+        );
+        assert!(
+            dispatches
+                .iter()
+                .any(|call| call.contains("no_anim",) && call.contains("unset")),
+            "the restore does not animate a window that was already open: {dispatches:?}"
+        );
+        assert!(
+            !dispatches.iter().any(|call| call.contains("address:0xaaa")),
+            "another app's window is never touched: {dispatches:?}"
+        );
+    }
+
+    #[test]
+    fn a_launch_of_an_app_with_no_window_dispatches_nothing() {
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_clients(
+            r#"[{"address":"0xaaa","class":"foot","workspace":{"name":"1"},"focusHistoryID":0}]"#,
+        );
+        actor(&recorder).raise_app("mailcraft").unwrap();
+        assert!(
+            recorder.dispatches().is_empty(),
+            "an app that has not mapped a window yet is left alone: {:?}",
+            recorder.dispatches()
+        );
     }
 
     #[test]

@@ -111,12 +111,12 @@ fn tools() -> Value {
             },
             {
                 "name": "shell_run",
-                "description": "Run one named desktop action: screenshot, lock, volume-up/down/mute, brightness-up/down, next/previous workspace, toggle-layout, fullscreen/maximize/restore-window (the focused window). Fixed actions only, confirmed in the card. Make a window full screen before a visual multi-step task.",
+                "description": "Run one named desktop action: lock, volume-up/down/mute, brightness-up/down, next/previous workspace, toggle-layout, fullscreen/maximize/restore-window (the focused window). Fixed actions only, confirmed in the card. To see the screen, use observe_screen — there is no screenshot action here.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "enum": [
-                            "screenshot", "lock", "volume-up", "volume-down", "volume-mute",
+                            "lock", "volume-up", "volume-down", "volume-mute",
                             "brightness-up", "brightness-down", "next-workspace",
                             "previous-workspace", "toggle-layout", "fullscreen", "maximize",
                             "restore-window"

@@ -51,11 +51,11 @@ usage: omassistantctl [--socket <path>] [--state-dir <path>] [--json] <command>
   act.key <chord>                       press one chord, e.g. super+return, ctrl+shift+t, escape
   act.clipboard read                    print what is on the clipboard
   act.clipboard write --text <text>|-   put text on the clipboard (- reads stdin)
-  act.launch browser|terminal|editor|mail  start one fixed desktop app
+  act.launch browser|terminal|editor|mail  open the app you have for that kind
   shell.run <action>                    run one named desktop action
-                                        (screenshot, lock, volume-up, volume-down,
-                                         volume-mute, brightness-up, brightness-down,
-                                         next-workspace, previous-workspace, toggle-layout)
+                                        (lock, volume-up, volume-down, volume-mute,
+                                         brightness-up, brightness-down, next-workspace,
+                                         previous-workspace, toggle-layout)
   consent grant <capability> --once     grant one call (default TTL 5 minutes)
   consent grant <capability> --for 1h   grant for a while (60s..24h)
   consent revoke <capability>           drop a grant
@@ -226,9 +226,9 @@ fn run() -> Result<(), Failure> {
         "shell.run" => {
             let action = arguments.first().ok_or_else(|| {
                 Failure::Usage(
-                    "shell.run needs an action: screenshot, lock, volume-up, volume-down, \
-                     volume-mute, brightness-up, brightness-down, next-workspace, \
-                     previous-workspace or toggle-layout"
+                    "shell.run needs an action: lock, volume-up, volume-down, volume-mute, \
+                     brightness-up, brightness-down, next-workspace, previous-workspace, \
+                     toggle-layout, fullscreen, maximize or restore-window"
                         .to_string(),
                 )
             })?;
