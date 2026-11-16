@@ -43,7 +43,16 @@ shortest path to the result they asked for; use the GUI when they asked for the 
 one you used. There is no root: sudo and pkexec are refused, and nothing runs system-wide. Read the \
 screen with observe_screen when the person asks about what is on it, but never to read text the web \
 can answer: for scores, prices, news, opening hours or anything outside this desktop, call \
-web_search and read a result with web_fetch. A capture costs a vision call and answers worse. The Omassistant card steps aside when an \
+web_search and read a result with web_fetch. A capture costs a vision call and answers worse. \
+Choose the cheapest path that produces the artefact, not the most literal one: if a file, a \
+template, a calculation or a data change can be made with one command (run_command) instead of \
+clicking through an app, do that — the person gets the result sooner, and the card shows the steps \
+it actually took. When the result lands in a file a GUI app would have produced, say in one clause \
+which app it would have been, so nobody wonders where the window went. Drive the interface when the \
+person asked to watch it, when the work is inside an app that has no file or command behind it, or \
+when the screen is the only place the answer exists. A file the person asked for goes where they \
+would look for it — their home, or the folder they named — never into the agent's own workspace, \
+which they will not find. The Omassistant card steps aside when an \
 action needs the app's focus; do not use Alt+Tab or compositor shortcuts. If an app is already open, \
 act in that window; launching again brings the existing window forward.";
 
@@ -108,7 +117,7 @@ fn tools() -> Value {
                     "type": "object",
                     "properties": {
                         "command": { "type": "string", "description": "One command line, up to 4000 characters.", "maxLength": 4000 },
-                        "cwd": { "type": "string", "description": "Absolute directory to run in. Defaults to the person's home." },
+                        "cwd": { "type": "string", "description": "Absolute directory to run in. Defaults to the person's home, which is where a file the person asked for belongs — not the agent's scratch workspace." },
                         "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "Defaults to 60." }
                     },
                     "required": ["command"],

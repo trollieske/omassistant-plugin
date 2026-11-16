@@ -301,13 +301,18 @@ function resolveAll(config, catalog, current) {
 // just did.
 function looksScreenWork(question) {
   var q = text(question)
-  if (/\b(screen|window|windows|click|right-click|double-click|scroll|type into|press|menu|button|tab|dialog|desktop|gui|file manager|files app|open the app|in the app|spreadsheet|excel|calc|impress|writer|skjerm(en|er)?|vindu(et|er)?|klikk|høyreklikk|dobbeltklikk|rul|skriv inn|trykk|meny(en|er)?|knapp(en|er)?|fane(n|r)?|dialog(en|er)?|skrivebord|filutforsker|filbehandler(en)?|regneark(et)?|åpne appen|i appen)\b/i
+  if (/\b(screen|window|windows|click|right-click|double-click|scroll|type into|press|menu|button|tab|dialog|desktop|gui|file manager|files app|open the app|in the app|spreadsheet|excel|calc|impress|writer|skjerm(en|er)?|vindu(et|er)?|klikk|høyreklikk|dobbeltklikk|rul|skriv inn|trykk|meny(en|er)?|knapp(en|er)?|fane(n|r)?|dialog(en|er)?|skrivebord|filutforsker|filbehandler(en)?|regneark(et)?|åpne appen|i appen|skjema(et)?|form|forms|field|felt)\b/i
       .test(q)) return true
   // Work inside a named application: an action verb, then "i"/"in" and a
   // capitalised name that is not the start of the sentence. "Sett opp en mal i
   // GridCraft" is driving a window; "hvor mange innbyggere i Bergen" is not.
   if (!looksAction(q)) return false
-  return /\b(?:i|in)\s+[A-ZÆØÅ][\w.+-]{1,}/.test(q.slice(1))
+  // "open the mail", "åpne filbehandleren": a verb that starts an app is screen
+  // work even when the app is named in lowercase.
+  if (/\b(open|launch|åpne|start)\s+(the\s+|den\s+|det\s+)?[a-zæøå][\wæøå-]{2,}/i.test(q)) return true
+  // A product name, not a place or a folder: "GridCraft" and "VS Code" have a
+  // second capital or an acronym, "Downloads" and "Bergen" do not.
+  return /\b(?:i|in)\s+(?:[A-ZÆØÅ][a-zæøå0-9]*[A-Z0-9][\w.+-]*|[A-Z]{2,}(?:\s+[A-Z][a-zæøå]+)?[\w.+-]*)/.test(q.slice(1))
 }
 
 function looksAction(question) {
@@ -315,7 +320,13 @@ function looksAction(question) {
   // exactly the long multi-step work Best exists for. Without these words a
   // "fill out this form" request used to be classified as a quick question and
   // sent to Fast; the Best model was never reached even when it was configured.
-  return /\b(open|launch|click|press|type|paste|copy|screenshot|screen|window|email|browser|terminal|volume|brightness|workspace|lock|play|pause|fill|form|field|submit|slide|slides|deck|presentation|spreadsheet|sheet|table|document|cell|row|column|format|rename|create|make|build|edit|update|add|remove|delete|move|select|choose|story|essay|article|poem|letter|åpne|start|klikk|trykk|skriv|lim|kopier|skjermbilde|skjerm|vindu|epost|e-post|nettleser|terminal|volum|lysstyrke|arbeidsflate|lås|spill|pause|fyll|skjema|send|lysbilde|presentasjon|regneark|tabell|dokument|celle|rad|kolonne|formater|gi nytt navn|lag|lagre|endre|oppdater|legg til|fjern|slett|flytt|velg|fortelling|essay|artikkel|dikt|brev|sett opp|sette opp|konfigurer|opprett|installer|fyll ut|regn ut|beregn|kalkuler|mal|kjøreliste)\b/i
+  return /\b(open|launch|click|press|type|paste|copy|screenshot|screen|window|email|browser|terminal|volume|brightness|workspace|lock|play|pause|fill|form|field|submit|slide|slides|deck|presentation|spreadsheet|sheet|table|document|cell|row|column|format|rename|create|make|build|edit|update|add|remove|delete|move|select|choose|story|essay|article|poem|letter|åpne|start|klikk|trykk|skriv|lim|kopier|skjermbilde|skjerm|vindu|epost|e-post|nettleser|terminal|volum|lysstyrke|arbeidsflate|lås|spill|pause|fyll|skjema|send|lysbilde|presentasjon|regneark|tabell|dokument|celle|rad|kolonne|formater|gi nytt navn|lag|lagre|endre|oppdater|legg til|fjern|slett|flytt|velg|fortelling|essay|artikkel|dikt|brev|sett opp|sette opp|konfigurer|opprett|installer|fyll ut|regn ut|beregn|kalkuler|mal|kjøreliste|rediger|jobbe)\b/i
+    .test(text(question))
+}
+
+// Writing that a person will read: the model's prose is the product.
+function looksContentWork(question) {
+  return /\b(essay|story|article|poem|letter|presentation|slides?|deck|draft|write|compose|skriv|fortelling|essay|artikkel|dikt|brev|presentasjon|lysbilde|utkast|formuler)\b/i
     .test(text(question))
 }
 
@@ -453,8 +464,13 @@ function choose(question, image, contextChars, state) {
   var onScreen = looksScreenWork(question)
   var deep = wantsDeep(question)
   var quick = wantsQuick(question) && text(question).length < 300
-  var complex = action || deep
-    || (!quick && (looksComplex(question) || Number(contextChars || 0) > 18000))
+  // A file or a command is a tool loop, not a reasoning problem: measured on this
+  // machine, the cheap model produced the same artefact in less time for a
+  // fraction of the cost. What earns the expensive model is prose a person will
+  // read, a genuinely deep question, or a long conversation.
+  var content = looksContentWork(question)
+  var complex = deep || content
+    || (!action && !quick && (looksComplex(question) || Number(contextChars || 0) > 18000))
   var follow = isFollowUp(question)
   var tier = complex ? "best" : "fast"
   if (follow && !deep && !quick && (state.lastTier === "fast" || state.lastTier === "best")) {
@@ -476,6 +492,12 @@ function choose(question, image, contextChars, state) {
       if (!model) return block("No configured model can see images. Pick a vision model in settings.")
       tier = "vision"
       thinking = "low"
+    } else if (resolved.best) {
+      // Screen work with no Screen model configured is still hard work: the
+      // strongest model is the better guess, not the cheap one.
+      tier = "best"
+      model = resolved.best
+      thinking = resolved.bestThinking
     }
   }
 

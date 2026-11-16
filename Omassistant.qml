@@ -295,6 +295,12 @@ Item {
   property var mediaImages: []
   property int mediaAt: 0
   property int lastRunStart: 0
+  // What the run has actually done, newest last, read from the broker's own audit.
+  // The card shows it as a workflow ("1 step · 0 clicks") while the model works:
+  // the steps are the real ones, the count is what proves no GUI was needed.
+  property var runSteps: []
+  property int runClicks: 0
+  property string runStartedIso: ""
 
   property alias session: runtime
 
@@ -545,8 +551,16 @@ Item {
 
   onBusyChanged: {
     if (root.busy) {
+      stepsPoll.restart()
       root.lastRunStart = Math.floor(Date.now() / 1000)
       root.mediaImages = []
+      root.runSteps = []
+      root.runClicks = 0
+      daemon.call("audit.tail", { lines: 1 }, function(ok, result) {
+        var entries = (result && typeof result.length === "number") ? result : []
+        root.runStartedIso = (ok && entries.length && entries[entries.length - 1])
+          ? String(entries[entries.length - 1].ts || "") : ""
+      })
       pendingPoll.start()
     } else {
       pendingPoll.stop()
@@ -937,6 +951,62 @@ Item {
 
   // Ask the broker what the last search came with. If the search is older than
   // this turn, it belongs to an earlier answer and is not shown.
+  // One audit entry, said in words a person recognises.
+  function stepLabel(entry) {
+    var method = String(entry.method || "")
+    var action = String(entry.action || "")
+    var target = String(entry.target || "")
+    if (method === "observe.screen") return "looking at " + (target.length ? target : "the screen")
+    if (method === "shell.exec") return action.length ? "ran " + action : "ran a command"
+    if (method === "web.search") return "searching the web"
+    if (method === "web.fetch") return action.length ? "reading " + action : "reading a page"
+    if (method === "act.pointer") return "clicking" + (target.length ? " in " + target : "")
+    if (method === "act.key") return "pressing keys" + (target.length ? " in " + target : "")
+    if (method === "act.type") return "typing" + (target.length ? " in " + target : "")
+    if (method === "act.clipboard") return "using the clipboard"
+    if (method === "act.launch") return "opening " + (action.length ? action : (target.length ? target : "an app"))
+    if (method === "shell.run") return "desktop: " + (action.length ? action : "an action")
+    if (method === "app.list") return "listing apps"
+    return ""
+  }
+
+  function isGuiStep(method) {
+    return method === "act.pointer" || method === "act.key" || method === "act.type"
+      || method === "act.launch"
+  }
+
+  // The audit is the only honest source for "what happened": it is written by the
+  // broker, not by the model.
+  function refreshSteps() {
+    if (!root.busy) return
+    var started = root.runStartedIso
+    daemon.call("audit.tail", { lines: 40 }, function(ok, result) {
+      if (!ok || !result) return
+      // audit.tail answers with a bare array. Written as plain statements: the
+      // nested ternary that did this read as correct and always produced [].
+      var entries = []
+      if (typeof result.length === "number") entries = result
+      else if (result.entries && typeof result.entries.length === "number") entries = result.entries
+      var steps = []
+      var clicks = 0
+      for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i]
+        if (!entry || String(entry.outcome || "") !== "allowed") continue
+        var method = String(entry.method || "")
+        if (method.indexOf("consent.") === 0 || method.indexOf("audit.") === 0) continue
+        if (method === "capabilities" || method === "ping") continue
+        // Only this run: the audit is append-only across runs.
+        if (started.length && String(entry.ts || "") < started) continue
+        var label = root.stepLabel(entry)
+        if (!label.length) continue
+        if (root.isGuiStep(method)) clicks += 1
+        steps.push({ label: label, method: method })
+      }
+      root.runSteps = steps.slice(-4)
+      root.runClicks = clicks
+    })
+  }
+
   function refreshMedia() {
     var startedAt = root.lastRunStart
     daemon.call("web.last", {}, function(ok, result) {
@@ -2768,10 +2838,13 @@ Item {
   // mail spam?") can end in a capture, and a text-only model would describe what it
   // imagines. Returns the model it switched to, or "" when nothing changed.
   function ensureScreenModel() {
-    var live = root.findModel(runtime.activeProvider, runtime.activeModelId)
-    if (live && Routing.hasVision(live)) return ""
     var resolved = root.resolvedTiers()
     if (!resolved.screen) return ""
+    var live = root.findModel(runtime.activeProvider, runtime.activeModelId)
+    // The configured Screen model takes the pictures, and it is not a question of
+    // whether the loaded model *can* see. A catalog will happily say a text model
+    // accepts images; a capture that is read badly is worse than a model switch,
+    // because the person then watches a blind model drive their desktop.
     if (live && String(live.id) === String(resolved.screen.id)
         && String(live.provider) === String(resolved.screen.provider)) return ""
     var name = resolved.screen.name || resolved.screen.id
@@ -3816,6 +3889,15 @@ Item {
     root.pendingProvider = ""
   }
 
+  // Polling the audit is cheap (one socket read) and it is the only way the card
+  // can show what the run did without asking the model to describe itself.
+  Timer {
+    id: stepsPoll
+    interval: 1200
+    repeat: true
+    onTriggered: root.refreshSteps()
+  }
+
   Process {
     id: trustProc
     onExited: function(exitCode) { root.onTrustSaved(exitCode) }
@@ -3899,6 +3981,8 @@ Item {
       previewUrl: root.previewUrl
       previewCaption: root.previewCaption
       mediaImages: root.mediaImages
+      runSteps: root.runSteps
+      runClicks: root.runClicks
       brokerActing: root.brokerGrantActive
       grantsOn: root.grantedCount > 0
       trusted: root.daemonTrusted

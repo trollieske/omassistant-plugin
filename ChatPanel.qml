@@ -84,6 +84,10 @@ Item {
   property string previewCaption: ""
   // Pictures the search behind the last answer came with (club badges, mostly).
   property var mediaImages: []
+  // What the run is doing, from the broker's audit: the steps are real, and the
+  // click count is the proof that most of them were not clicks.
+  property var runSteps: []
+  property int runClicks: 0
   property int recallIndex: -1
   property string recallDraft: ""
   property bool permissionsOpen: false
@@ -1304,6 +1308,51 @@ Item {
         anchors.bottom: composerRule.top
         anchors.bottomMargin: Style.spacing.md
         height: root.setupMode ? 0 : root.composerHeight
+
+        // The run as a workflow. A person watching a GUI agent sees steps happen;
+        // this shows the same thing, and the header says how many of them were
+        // clicks — usually none, because a command did the work.
+        Item {
+          id: stepsStrip
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.top
+          anchors.bottomMargin: Style.space(10)
+          height: visible ? stepColumn.implicitHeight + Style.space(4) : 0
+          visible: root.busy && !root.blank && root.runSteps.length > 0
+
+          Column {
+            id: stepColumn
+            width: parent.width
+            spacing: Style.space(2)
+
+            Text {
+              textFormat: Text.PlainText
+              text: root.runSteps.length + (root.runSteps.length === 1 ? " STEP" : " STEPS")
+                + "  ·  " + root.runClicks + (root.runClicks === 1 ? " CLICK" : " CLICKS")
+              color: root.textTertiary
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.0
+            }
+
+            Repeater {
+              model: root.runSteps
+              delegate: Text {
+                required property int index
+                required property var modelData
+                textFormat: Text.PlainText
+                width: stepColumn.width
+                elide: Text.ElideRight
+                text: (index === root.runSteps.length - 1 ? "▸ " : "  ") + modelData.label
+                color: index === root.runSteps.length - 1 ? root.accent : root.textSecondary
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+          }
+        }
 
         // Where the last answer came from: the search returned these with it.
         // Small enough to be a footnote, real enough to be worth showing.
