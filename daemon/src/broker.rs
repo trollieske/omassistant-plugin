@@ -648,12 +648,20 @@ impl Broker {
         let action = crate::act::launch_action(action)?;
         trace.action = Some(action.to_string());
 
+        // Which app this verb opens is decided here, from the person's own settings, before
+        // consent is asked: the confirmation should name the app that will actually open.
+        let app = self.launch_app(action)?;
+        let summary = match &app {
+            LaunchApp::Command => format!("Open the {action}"),
+            LaunchApp::Desktop(id) => format!("Open {}", crate::launch::display_name(id)),
+        };
+
         let now_unix = now.unix_timestamp();
         let grant = self.require_grant_interactive(
             &caps::ACT_LAUNCH,
             "one launch",
             wants_confirmation(params),
-            format!("Open the {action}"),
+            summary,
             "act.launch",
             None,
             AllowPolicy::Once,
@@ -661,11 +669,18 @@ impl Broker {
             now_unix,
         )?;
 
-        self.actor.launch(action)?;
+        match &app {
+            LaunchApp::Command => self.actor.launch(action)?,
+            LaunchApp::Desktop(id) => self.actor.launch_desktop(id)?,
+        }
         self.charge(&grant, caps::ACT_LAUNCH.name, now_unix)?;
         Ok(json!({
             "method": "act.launch",
             "action": action,
+            "app": match &app {
+                LaunchApp::Command => action,
+                LaunchApp::Desktop(id) => id.as_str(),
+            },
         }))
     }
 
@@ -1201,6 +1216,30 @@ impl Broker {
         }
     }
 
+    /// Which app one launch verb starts on this machine.
+    ///
+    /// The verb is the caller's; the app is not. A per-verb desktop id from the person's
+    /// `config.json` wins, then `mail` falls back to the desktop's own `mailto` handler, and the
+    /// three verbs Omarchy has a default for use its launcher. Nothing here reads a value from the
+    /// request, so a caller cannot choose the program.
+    fn launch_app(&self, verb: &str) -> Result<LaunchApp, ApiError> {
+        let overrides = crate::launch::LaunchOverrides::read(self.paths.config_file())?;
+        if let Some(id) = overrides.for_verb(verb) {
+            return Ok(LaunchApp::Desktop(id.to_string()));
+        }
+        if verb != "mail" {
+            return Ok(LaunchApp::Command);
+        }
+        match self.actor.mail_handler()? {
+            Some(id) => Ok(LaunchApp::Desktop(id)),
+            None => Err(ApiError::new(
+                ErrorCode::LaunchFailed,
+                "no mail app is set up: this desktop has no mailto handler, and \
+                 ~/.config/omassistant/config.json has no \"launch\": {\"mail\": \"<App>.desktop\"}",
+            )),
+        }
+    }
+
     /// The focused window, recorded for the audit entry, or `no_window`.
     fn focused_window(&self, trace: &mut Trace) -> Result<FocusedWindow, ApiError> {
         let window = self.actor.focused_window()?;
@@ -1354,6 +1393,15 @@ fn wants_confirmation(params: &Map<String, Value>) -> bool {
         .get("interactive")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+/// What one launch verb starts on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchApp {
+    /// Omarchy's own launcher for `browser`, `terminal` and `editor`.
+    Command,
+    /// A desktop entry the person chose (or the desktop's `mailto` handler).
+    Desktop(String),
 }
 
 /// The window, or the screen, is no longer the one the person approved.

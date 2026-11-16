@@ -70,7 +70,7 @@ fn tools() -> Value {
             },
             {
                 "name": "act_launch",
-                "description": "Launch one of a fixed set of desktop apps that is not already open: browser, terminal, editor, mail (Betterbird). If the app is already open, use that window instead; this starts a new copy.",
+                "description": "Open one of four fixed app kinds: browser, terminal, editor or mail. Which app that is, is the person's own choice (Omarchy's default browser/terminal/editor, and their mail app); you name the kind, never a program. If the app is already open, use that window instead; this starts a new copy.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

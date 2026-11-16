@@ -53,14 +53,21 @@ use std::time::Duration;
 pub const MAX_TYPE_CHARS: usize = 4_000;
 /// The most characters `act.clipboard write` will put on the clipboard.
 pub const MAX_CLIPBOARD_CHARS: usize = 100_000;
-/// The fixed launch commands. A name maps to one program; there are no arguments a caller can add,
-/// no paths, no shell. `omarchy-launch-*` is the platform's own launcher family.
+/// The launch verbs Omarchy has a launcher for. Each maps to one program; there are no arguments a
+/// caller can add, no paths, no shell. `omarchy-launch-*` already follows
+/// `omarchy default browser|terminal|editor`, so the app is the person's choice made in Omarchy.
+///
+/// `mail` is deliberately absent: Omarchy has no default mail app, so the broker opens the
+/// desktop's own `mailto` handler, or the app named in `config.json` (see [`crate::launch`]).
 pub const LAUNCH_ACTIONS: &[(&str, &[&str])] = &[
     ("browser", &["omarchy-launch-browser"]),
     ("terminal", &["omarchy-launch-terminal"]),
     ("editor", &["omarchy-launch-editor"]),
-    ("mail", &["betterbird"]),
 ];
+
+/// Every verb `act.launch` accepts. A verb is a fixed word from this list; the app behind it is
+/// the person's, never the caller's.
+pub const LAUNCH_VERBS: &[&str] = &["browser", "terminal", "editor", "mail"];
 
 /// How long a launch may take before it is killed.
 pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,16 +93,15 @@ pub fn shell_action(name: &str) -> Result<&'static str, ApiError> {
 /// Consent comes before the launch, so the name is checked here first and the actual start
 /// happens in [`Actor::launch`].
 pub fn launch_action(name: &str) -> Result<&'static str, ApiError> {
-    LAUNCH_ACTIONS
+    LAUNCH_VERBS
         .iter()
-        .find(|(candidate, _)| *candidate == name)
-        .map(|(candidate, _)| *candidate)
+        .find(|candidate| **candidate == name)
+        .copied()
         .ok_or_else(|| {
-            let names: Vec<&str> = LAUNCH_ACTIONS.iter().map(|(name, _)| *name).collect();
             ApiError::invalid(format!(
                 "\"{}\" is not a launch action; choose one of: {}",
                 one_line(name, 32),
-                names.join(", ")
+                LAUNCH_VERBS.join(", ")
             ))
         })
 }
@@ -325,12 +331,54 @@ impl Actor {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| ApiError::internal("a launch action has no program"))?;
+        self.spawn(program, args, name)
+    }
+
+    /// Start a desktop entry by id, through `gtk-launch`.
+    ///
+    /// The id is validated where it enters the daemon ([`crate::launch::validate_desktop_id`]),
+    /// so what reaches `gtk-launch` is a file name, never a path or an option. This is how
+    /// `act.launch` opens the app the person actually has installed rather than one hard-coded
+    /// program name.
+    pub fn launch_desktop(&self, id: &str) -> Result<(), ApiError> {
+        let id = crate::launch::validate_desktop_id(id)?;
+        self.spawn("gtk-launch", &[&id], &id)
+    }
+
+    /// The desktop's own handler for `mailto:` links, if one is registered.
+    ///
+    /// `xdg-mime` is the same lookup the desktop uses when a person clicks a mail link, so this
+    /// answers "which app do you open mail with" instead of guessing.
+    pub fn mail_handler(&self) -> Result<Option<String>, ApiError> {
+        let output = self.runner.run(
+            "xdg-mime",
+            &["query", "default", "x-scheme-handler/mailto"],
+            ACT_TIMEOUT,
+        )?;
+        if !output.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let id = text.lines().next().unwrap_or_default().trim();
+        if id.is_empty() {
+            return Ok(None);
+        }
+        // A handler that is not a desktop id is not something to hand to gtk-launch.
+        Ok(crate::launch::validate_desktop_id(id).ok())
+    }
+
+    /// Start one program with no shell, and turn a failure into `launch_failed`.
+    fn spawn(&self, program: &str, args: &[&str], label: &str) -> Result<(), ApiError> {
         // Launch actions are fire-and-forget: the app is meant to outlive this
         // call, so waiting for it would turn a success into a timeout.
         self.runner.spawn_detached(program, args).map_err(|err| {
             ApiError::new(
                 ErrorCode::LaunchFailed,
-                format!("{} could not start ({})", name, err.message()),
+                format!(
+                    "{} could not start ({})",
+                    one_line(label, 64),
+                    err.message()
+                ),
             )
         })
     }
@@ -988,6 +1036,8 @@ mod tests {
         wl_copy_fails: Mutex<bool>,
         paste: Mutex<Vec<u8>>,
         paste_fails: Mutex<bool>,
+        /// What `xdg-mime query default x-scheme-handler/mailto` answers.
+        mail_handler: Mutex<String>,
     }
 
     impl Recorder {
@@ -1012,6 +1062,10 @@ mod tests {
 
         fn set_cursor(&self, position: &str) {
             *self.cursor.lock().unwrap() = position.to_string();
+        }
+
+        fn set_mail_handler(&self, handler: &str) {
+            *self.mail_handler.lock().unwrap() = handler.to_string();
         }
 
         fn fail_wtype(&self, timed_out: bool) {
@@ -1048,6 +1102,8 @@ mod tests {
                     timed_out: false,
                 },
                 "wlrctl" => ok(Vec::new()),
+                "gtk-launch" => ok(Vec::new()),
+                "xdg-mime" => ok(self.mail_handler.lock().unwrap().clone().into_bytes()),
                 "wtype" => {
                     if *self.wtype_times_out.lock().unwrap() {
                         return CommandOutput {
@@ -1147,7 +1203,6 @@ mod tests {
             ("browser", "omarchy-launch-browser"),
             ("terminal", "omarchy-launch-terminal"),
             ("editor", "omarchy-launch-editor"),
-            ("mail", "betterbird"),
         ] {
             assert_eq!(launch_action(name).unwrap(), name);
             let recorder = Arc::new(Recorder::new());
@@ -1160,6 +1215,47 @@ mod tests {
         for bad in ["sh", "omarchy-launch-browser", "browser --private", ""] {
             assert!(launch_action(bad).is_err(), "{bad} must be refused");
         }
+        // `mail` is a verb with no program of ours: the person's app decides.
+        assert_eq!(launch_action("mail").unwrap(), "mail");
+        assert!(actor(&Arc::new(Recorder::new())).launch("mail").is_err());
+    }
+
+    #[test]
+    fn a_desktop_app_starts_by_id_and_nothing_else() {
+        let recorder = Arc::new(Recorder::new());
+        actor(&recorder)
+            .launch_desktop("io.github.billsecond.mailcraft.desktop")
+            .unwrap();
+        let calls = recorder.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].program, "gtk-launch");
+        assert_eq!(calls[0].args, ["io.github.billsecond.mailcraft.desktop"]);
+
+        // Anything that is not a desktop id never reaches gtk-launch.
+        for bad in ["/bin/sh", "Mail.desktop -x", "-k", "../../bin/sh"] {
+            let recorder = Arc::new(Recorder::new());
+            assert!(actor(&recorder).launch_desktop(bad).is_err(), "{bad}");
+            assert!(recorder.calls().is_empty(), "{bad} reached a tool");
+        }
+    }
+
+    #[test]
+    fn the_mail_handler_is_the_desktop_handler() {
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_mail_handler("HEY.desktop");
+        assert_eq!(
+            actor(&recorder).mail_handler().unwrap(),
+            Some("HEY.desktop".to_string())
+        );
+
+        // A handler that is not a desktop id is ignored rather than handed on.
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_mail_handler("something weird");
+        assert_eq!(actor(&recorder).mail_handler().unwrap(), None);
+
+        // No handler at all is `None`, not an error.
+        let recorder = Arc::new(Recorder::new());
+        assert_eq!(actor(&recorder).mail_handler().unwrap(), None);
     }
 
     #[test]

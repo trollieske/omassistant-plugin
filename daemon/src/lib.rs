@@ -39,6 +39,7 @@ pub mod error;
 pub mod exec;
 pub mod grants;
 pub mod ids;
+pub mod launch;
 pub mod paths;
 pub mod protocol;
 pub mod server;

@@ -21,19 +21,36 @@ pub const FILE_MODE: u32 = 0o600;
 /// The longest file name component this daemon will turn into a path.
 pub const MAX_FILE_NAME_BYTES: usize = 200;
 
-/// The resolved socket and state locations.
+/// The resolved socket, state and configuration locations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     socket: PathBuf,
     state_dir: PathBuf,
+    config_file: PathBuf,
 }
 
 impl Paths {
-    /// Build from explicit locations.
+    /// Build from explicit locations, with the configuration file resolved the
+    /// way the plugin resolves it (`$XDG_CONFIG_HOME/omassistant/config.json`).
     pub fn new(socket: impl Into<PathBuf>, state_dir: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
             state_dir: state_dir.into(),
+            config_file: default_config_file(),
+        }
+    }
+
+    /// Build with an explicit configuration file as well. Tests use this so a
+    /// launch action never reads the real person's settings.
+    pub fn with_config(
+        socket: impl Into<PathBuf>,
+        state_dir: impl Into<PathBuf>,
+        config_file: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            socket: socket.into(),
+            state_dir: state_dir.into(),
+            config_file: config_file.into(),
         }
     }
 
@@ -50,12 +67,23 @@ impl Paths {
             Some(path) => path,
             None => default_state_dir()?,
         };
-        Ok(Self { socket, state_dir })
+        Ok(Self {
+            socket,
+            state_dir,
+            config_file: default_config_file(),
+        })
     }
 
     /// The Unix socket the daemon listens on.
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// The assistant's own settings file, written by the plugin (mode 0600).
+    /// Only read here: which app `act.launch` opens is the owner's choice, and
+    /// this file is where they make it.
+    pub fn config_file(&self) -> &Path {
+        &self.config_file
     }
 
     /// The state directory (`omassistant`).
@@ -146,6 +174,25 @@ pub fn default_state_dir() -> Result<PathBuf, ApiError> {
             "neither XDG_STATE_HOME nor HOME is set, so there is nowhere to keep grants and \
              audit entries; pass --state-dir <path>",
         )),
+    }
+}
+
+/// `$XDG_CONFIG_HOME/omassistant/config.json` or `~/.config/omassistant/config.json`.
+///
+/// No error when neither variable is set: a daemon without a settings file simply
+/// has no per-app choices, which is the normal first run.
+pub fn default_config_file() -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        if !dir.is_empty() {
+            return PathBuf::from(dir).join("omassistant").join("config.json");
+        }
+    }
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => PathBuf::from(home)
+            .join(".config")
+            .join("omassistant")
+            .join("config.json"),
+        _ => PathBuf::new(),
     }
 }
 

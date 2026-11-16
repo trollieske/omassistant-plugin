@@ -87,8 +87,8 @@ instructions"; the broker still checks the grant. The model can ask; it cannot g
   `wl-copy` and `wl-paste` (clipboard), `curl` (loopback local-model discovery), and the usual
   Omarchy helpers (`omarchy-launch-*`, `omarchy-capture-screenshot`, etc.).
 - **Optional:** ImageMagick (`magick`) for smaller screenshots; `wlrctl` for pointer control;
-  one of the dictation backends Omarchy offers (voxtype, Superwhisper, Hex); Betterbird for the
-  `mail` launch action.
+  one of the dictation backends Omarchy offers (voxtype, Superwhisper, Hex); any mail app the
+  desktop can open for `mailto:` links (see below).
 - A free keybinding for the overlay. The plugin does not register global shortcuts itself.
 
 ## Install
@@ -132,8 +132,19 @@ omarchy pkg add imagemagick        # smaller JPEG captures
 omarchy pkg aur add wlrctl         # pointer move/click/scroll
 ```
 
-For the `mail` launch action, make sure a `betterbird` binary is on `PATH` (the action calls it
-by name; use another client only after editing the fixed table in `daemon/src/act.rs`).
+`act.launch` names four app *kinds* — browser, terminal, editor, mail — never a program. The app
+behind each is yours: browser, terminal and editor use Omarchy's own launchers, so they follow
+`omarchy default browser|terminal|editor`. Mail uses whatever this desktop opens for `mailto:`
+links (`xdg-mime query default x-scheme-handler/mailto`), and you can point it at a specific app
+with a desktop id instead:
+
+```json
+{ "launch": { "mail": "io.github.billsecond.mailcraft.desktop" } }
+```
+
+That is `~/.config/omassistant/config.json`; the id is the name of the app's `.desktop` file
+(`ls /usr/share/applications ~/.local/share/applications`). It is an app id, not a command — the
+broker refuses anything else, so neither the model nor a stray socket client can pick the program.
 
 Set up dictation with Omarchy's own flow (`omarchy install dictation voxtype`, or Superwhisper)
 if you want `Ctrl+D`. Omassistant reads whichever backend `omarchy default dictation` names and
@@ -200,7 +211,7 @@ Every capability is separate; grants can be time-limited; the audit is immediate
 | `/help` | The full in-card command list |
 | `/clear`, `/stop`, `/settings`, `/permissions`, `/costs` | The obvious shortcuts |
 | `/run <action>` | Run a fixed `shell.run` action |
-| `/open browser\|terminal\|editor\|mail` | Launch a fixed app action |
+| `/open browser\|terminal\|editor\|mail` | Open the app you have for that kind |
 
 From outside the card:
 
@@ -225,7 +236,7 @@ Seven capabilities, each a separate grant:
 - `act.keys` — press keys and shortcuts in the focused window
 - `act.pointer` — click, double-click, right-click, middle-click, scroll or move inside the focused window
 - `act.clipboard` — read or write the clipboard
-- `act.launch` — launch browser, terminal, editor or mail when it is not already open
+- `act.launch` — open your browser, terminal, editor or mail app when it is not already open
 - `shell.run` — a fixed table of desktop actions (screenshot, lock, volume, brightness, workspace,
   layout, fullscreen/maximize/restore)
 
