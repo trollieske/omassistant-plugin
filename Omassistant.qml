@@ -2745,11 +2745,15 @@ Item {
       broker: daemon.connected,
       granted: root.grantedCount,
       version: root.manifest && root.manifest.version ? String(root.manifest.version) : "",
+      // An invitation, not a chore list. Each one shows a different kind of work —
+      // looking, running, acting, remembering — and each ends in something a person
+      // actually wants to know. "Make three folders" is a task; "what is this window
+      // asking me to do" is a reason to have an assistant.
       ideas: [
-        { prompt: "What is this window showing, and what does the error mean?" },
-        { prompt: "Open the file manager and make three folders in Documents" },
-        { prompt: "Sort my Downloads into folders by file type" },
-        { prompt: "What have I spent on this assistant, and on which model?" }
+        { prompt: "Find my newest screenshot and tell me what I was working on." },
+        { prompt: "What is eating my disk space?" },
+        { prompt: "Read this window and tell me what it wants from me." },
+        { prompt: "What did I just copy?" }
       ]
     }
   }

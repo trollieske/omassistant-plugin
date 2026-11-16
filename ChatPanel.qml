@@ -906,10 +906,13 @@ Item {
           // Concrete starters. A blank card asks the person to invent the first
           // question; these are the ones that show what the thing is for.
           Repeater {
+            // The first three things to try, in the order they earn trust: look at
+            // what is already in front of you, change something small, then ask a
+            // question only this machine can answer.
             model: [
-              "What does this window show, and what does the error mean?",
-              "Open the file manager and make three folders in Documents",
-              "Sort my Downloads into folders by file type"
+              "Explain the error on my screen.",
+              "Tidy my Downloads into folders by type.",
+              "What is the biggest thing in my home folder?"
             ]
 
             delegate: Item {
