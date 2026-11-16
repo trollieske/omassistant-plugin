@@ -41,7 +41,9 @@ in their own shell (run_command) for file work, installs, git or anything a term
 a window with act_type, act_key and act_pointer when the person wants to watch it happen. Prefer the \
 shortest path to the result they asked for; use the GUI when they asked for the GUI, and say which \
 one you used. There is no root: sudo and pkexec are refused, and nothing runs system-wide. Read the \
-screen with observe_screen when the person asks about it. The Omassistant card steps aside when an \
+screen with observe_screen when the person asks about what is on it, but never to read text the web \
+can answer: for scores, prices, news, opening hours or anything outside this desktop, call \
+web_search and read a result with web_fetch. A capture costs a vision call and answers worse. The Omassistant card steps aside when an \
 action needs the app's focus; do not use Alt+Tab or compositor shortcuts. If an app is already open, \
 act in that window; launching again brings the existing window forward.";
 
@@ -110,6 +112,30 @@ fn tools() -> Value {
                         "timeoutSeconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "Defaults to 60." }
                     },
                     "required": ["command"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "web_search",
+                "description": "Look something up on the web, in the background. Use this instead of looking at the screen for anything the desktop does not show: scores, prices, news, opening hours, a version number, what happened today. It asks a search index (You.com, Brave, Tavily or Serper when the person configured a key, otherwise a news index plus an encyclopedia), and returns up to six results with links and dates (\"source\" says which). The person confirms the query in the card, because a query can carry something private. This is already a search: do not fetch google.com or duckduckgo.com to search again, they answer a bot with a challenge page — read one of the returned links with web_fetch instead.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "What to look up, as you would type it into a search field.", "maxLength": 200 }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "name": "web_fetch",
+                "description": "Read one public web page as text — the page a search result points at, or one you already know the address of (a Wikipedia article, a club's fixtures page). Only http and https, only public hosts; this machine's own services and private networks are refused. The person confirms the host in the card.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "A full http:// or https:// URL.", "maxLength": 2000 }
+                    },
+                    "required": ["url"],
                     "additionalProperties": false
                 }
             },
@@ -217,6 +243,26 @@ fn card_state() -> (bool, bool) {
             (opened, stepped)
         }
         _ => (false, false),
+    }
+}
+
+/// Ask the card to put a model that can see in place before a capture, so the
+/// image is returned to eyes rather than to a model that will describe what it
+/// imagines from the text alone. Best-effort: a card that says nothing leaves the
+/// model as it is.
+fn ensure_screen_model() {
+    let switched = Command::new("omarchy-shell")
+        .args(["omassistant", "ensureScreen"])
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(output) = switched {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if text.trim().len() > 2 {
+                // set_model is a millisecond call; give it a beat before the pixels.
+                std::thread::sleep(Duration::from_millis(350));
+            }
+        }
     }
 }
 
@@ -329,6 +375,14 @@ fn map_call(name: &str, arguments: &Map<String, Value>) -> Result<(&'static str,
             }
             Ok(("shell.exec", params))
         }
+        "web_search" => {
+            let query = string_argument(arguments, "query")?;
+            Ok(("web.search", json!({ "query": query, "interactive": true })))
+        }
+        "web_fetch" => {
+            let url = string_argument(arguments, "url")?;
+            Ok(("web.fetch", json!({ "url": url, "interactive": true })))
+        }
         "shell_run" => {
             let action = string_argument(arguments, "action")?;
             Ok((
@@ -436,6 +490,84 @@ fn success_text(method: &str, result: &Value) -> String {
                 .and_then(Value::as_str)
                 .unwrap_or("the screen");
             format!("Captured {what}; the image is attached.")
+        }
+        // The two lookups: the model has to *see* what came back, or it will say
+        // the tools were empty and answer from memory.
+        "web.search" => {
+            let results = result["results"].as_array().cloned().unwrap_or_default();
+            if results.is_empty() {
+                let hint = result.get("hint").and_then(Value::as_str).unwrap_or("");
+                return format!("Nothing found. {hint}").trim().to_string();
+            }
+            let mut out = format!(
+                "{} result{} for \"{}\":",
+                results.len(),
+                if results.len() == 1 { "" } else { "s" },
+                result.get("query").and_then(Value::as_str).unwrap_or("")
+            );
+            for hit in results {
+                let title = hit.get("title").and_then(Value::as_str).unwrap_or("");
+                let url = hit.get("url").and_then(Value::as_str).unwrap_or("");
+                let when = hit.get("when").and_then(Value::as_str).unwrap_or("");
+                let source = hit.get("source").and_then(Value::as_str).unwrap_or("");
+                let snippet = hit.get("snippet").and_then(Value::as_str).unwrap_or("");
+                out.push_str(&format!("\n\n{title}"));
+                if !when.is_empty() {
+                    out.push_str(&format!(" ({when})"));
+                }
+                if !source.is_empty() {
+                    out.push_str(&format!(" [{source}]"));
+                }
+                if !snippet.is_empty() {
+                    out.push_str(&format!("\n{snippet}"));
+                }
+                out.push_str(&format!("\n{url}"));
+            }
+            out
+        }
+        "web.fetch" => {
+            let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+            let host = result
+                .get("host")
+                .and_then(Value::as_str)
+                .unwrap_or("the page");
+            format!(
+                "{host}, as text ({} characters):\n\n{text}",
+                text.chars().count()
+            )
+        }
+        // A command's output *is* the result; without it the model cannot tell a
+        // success from a silent failure.
+        "shell.exec" => {
+            let code = result.get("exitCode").and_then(Value::as_i64).unwrap_or(-1);
+            let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+            let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
+            let mut out = format!("exit {code}");
+            if result.get("timedOut").and_then(Value::as_bool) == Some(true) {
+                out.push_str(", timed out");
+            }
+            if !stdout.trim().is_empty() {
+                out.push_str(&format!("\nstdout:\n{}", stdout.trim_end()));
+            }
+            if !stderr.trim().is_empty() {
+                out.push_str(&format!("\nstderr:\n{}", stderr.trim_end()));
+            }
+            if stdout.trim().is_empty() && stderr.trim().is_empty() {
+                out.push_str(", no output");
+            }
+            out
+        }
+        "app.list" => {
+            let apps = result["apps"].as_array().cloned().unwrap_or_default();
+            let mut out = format!("{} installed apps:", apps.len());
+            for app in apps {
+                out.push_str(&format!(
+                    "\n{}\t{}",
+                    app.get("name").and_then(Value::as_str).unwrap_or(""),
+                    app.get("id").and_then(Value::as_str).unwrap_or("")
+                ));
+            }
+            out
         }
         _ => "Done.".to_string(),
     }
@@ -570,6 +702,10 @@ fn call_tool(
             step_aside();
         }
     }
+    // A capture is looked at: make sure the model in use can see.
+    if name == "observe_screen" {
+        ensure_screen_model();
+    }
     let outcome = connection.call(method, Some(&params));
     match outcome {
         Ok(result) => {
@@ -630,6 +766,8 @@ mod tests {
                 "list_apps",
                 "launch_app",
                 "run_command",
+                "web_search",
+                "web_fetch",
                 "act_clipboard",
                 "act_pointer",
                 "shell_run",
@@ -726,6 +864,95 @@ mod tests {
         args.insert("text".to_string(), json!(7));
         assert!(map_call("act_clipboard", &args).is_err());
         assert!(map_call("shell_run", &Map::new()).is_err());
+    }
+
+    #[test]
+    fn every_tool_reports_what_it_did() {
+        // The tools the model can call, with the method each one maps to and a
+        // result the daemon would really return. "Done." is the fallback for a
+        // method nobody formatted, and that is exactly how a model ends up
+        // telling the person that the tools came back empty.
+        let cases: Vec<(&str, &str, Value)> = vec![
+            (
+                "act_type",
+                "act.type",
+                json!({"chars": 1, "target": {"class": "x"}}),
+            ),
+            (
+                "act_key",
+                "act.key",
+                json!({"chord": "Return", "target": {"class": "x"}}),
+            ),
+            (
+                "act_pointer",
+                "act.pointer",
+                json!({"action": "click", "app": "x"}),
+            ),
+            (
+                "act_clipboard",
+                "act.clipboard",
+                json!({"mode": "copy", "bytes": 3}),
+            ),
+            ("act_launch", "act.launch", json!({"action": "terminal"})),
+            ("launch_app", "act.launch", json!({"app": "folio.desktop"})),
+            ("list_apps", "app.list", json!({"apps": []})),
+            ("shell_run", "shell.run", json!({"action": "lock"})),
+            (
+                "run_command",
+                "shell.exec",
+                json!({"exitCode": 0, "timedOut": false, "stdout": "ok", "stderr": ""}),
+            ),
+            (
+                "web_search",
+                "web.search",
+                json!({"results": [{"title": "t", "url": "u", "when": "", "source": "news", "snippet": "s"}]}),
+            ),
+            (
+                "web_fetch",
+                "web.fetch",
+                json!({"host": "example.com", "text": "words"}),
+            ),
+            (
+                "observe_screen",
+                "observe.screen",
+                json!({"window": {"class": "x"}}),
+            ),
+        ];
+        let tools = tools();
+        let names: Vec<&str> = tools["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), cases.len(), "a tool has no case here");
+        for (tool, method, result) in cases {
+            assert!(names.contains(&tool), "{tool} is not in the tool list");
+            let text = success_text(method, &result);
+            assert_ne!(text, "Done.", "{tool} falls through to the fallback");
+            assert!(!text.trim().is_empty(), "{tool} says nothing");
+        }
+    }
+
+    #[test]
+    fn a_search_reports_its_results_and_a_command_its_output() {
+        let text = success_text(
+            "web.search",
+            &json!({"query": "bergen", "results": [
+                {"title": "Bergen", "url": "https://x/1", "when": "", "source": "wikipedia", "snippet": "a city"}
+            ]}),
+        );
+        assert!(text.contains("Bergen"), "{text}");
+        assert!(text.contains("a city"), "{text}");
+        assert!(text.contains("https://x/1"), "{text}");
+        assert!(success_text("web.search", &json!({"results": []})).contains("Nothing"));
+
+        let text = success_text(
+            "shell.exec",
+            &json!({"exitCode": 2, "stdout": "", "stderr": "no such file"}),
+        );
+        assert!(text.contains("exit 2"), "{text}");
+        assert!(text.contains("no such file"), "{text}");
     }
 
     #[test]

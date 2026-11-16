@@ -239,7 +239,7 @@ omassistantctl costs --json
 
 ## Permissions
 
-Seven capabilities, each a separate grant:
+Nine capabilities, each a separate grant:
 
 - `observe.screen` — capture the focused window or a monitor and send the image to the selected model
 - `act.type` — type text into the focused app
@@ -253,6 +253,9 @@ Seven capabilities, each a separate grant:
   the exact command unless you grant it for a while
 - `shell.run` — a fixed table of desktop actions (lock, volume, brightness, workspace, layout,
   fullscreen/maximize/restore)
+
+- `web.search` — look something up on the web (a news index and an encyclopedia, or **You.com**,
+  Brave, Tavily or Serper with a key you supply) and read one public page as text
 
 How it behaves:
 
@@ -286,6 +289,40 @@ The broker is a permission gate, not a sandbox. It cannot make a malicious plugi
 cannot stop a model from being wrong. It can make every privileged effect visible, separate and
 revocable.
 
+### Web search
+
+Settings has one row for the service and one for the key. **You.com** is the one built for agents:
+one call returns page text with each result, so the answer rarely needs a second request, and it
+answers in about 0.2 s warm. Brave, Tavily and Serper work too. The key is written to
+`~/.local/state/omassistant/web.json` with mode 0600, never appears on a command line, and never
+shows up in the card, the audit or the repository. Without a key the built-in path still works — a
+news feed plus Wikipedia, about 0.4 s — and finds less.
+
+```sh
+printf '%s\n' "$YDC_API_KEY" | omassistantctl web.config --provider you
+omassistantctl web.status
+omassistantctl web.search "Vålerenga resultat"      # asks the card unless the machine is trusted
+```
+
+### Trusting this machine
+
+If this is your own machine and you are testing, typing Enter every few seconds is friction with no
+security value — the threat model is a plugin acting on *your* desktop, not on someone else's.
+`omassistantctl trust on` writes `trust.json` to the state directory and the broker keeps a
+standing grant for every capability, so nothing asks:
+
+```sh
+omassistantctl trust on      # nothing asks; every call is still audited
+omassistantctl trust status
+omassistantctl trust off     # back to asking for each capability
+```
+
+The switch is off unless you turn it on, it is a local file you can delete, and the audit log records
+every call with `grant=standing` even while it is on. The card's pill says **TRUSTED** so a machine
+in that state is never a guess. The escape hatches stay: `sudo`, `pkexec`, `doas` and `su` are
+refused by name, a URL pointing at your own machine or a private network is refused, and `STOP`
+still ends a run.
+
 ## Models, routing and cost
 
 Omassistant does not ship, proxy or resell a model. It drives pi, and pi drives the provider you
@@ -297,21 +334,61 @@ The Settings sheet has one model choice per role:
 - **Default** — every question when automatic choice is off.
 - **Fast** — short, informational questions.
 - **Best** — longer, creative or action-shaped work.
+- **Screen** — seeing and driving the desktop: a look, a click, typing into an app,
+  a menu. It has to be a model that can look at the screen, so the card falls back
+  to the first vision-capable model you have rather than sending GUI work to one
+  that cannot see.
 - **Local** — the explicit local model used by *Keep everything on this computer*.
 
 Automatic choice is off by default and becomes meaningful only when Fast and Best are different.
 A switch is a single `set_model` RPC call: no restart, no lost session. The routing decision is a
 pure function in `Routing.js`, so it can be read and tested without the model. It routes short
 questions to Fast, complex or action-shaped requests to Best, keeps follow-ups on the previous tier,
-sends images only to a vision model, and blocks an image or a cloud request when local-only is on.
+sends images only to a vision model, routes GUI work to the Screen model, and blocks an
+image or a cloud request when local-only is on. The heuristics read English and
+Norwegian, because people ask in their own language.
 That block is checked again at the moment a question is sent, not only when the route is chosen: if
 a switch to the local model fails or times out, the question and its screenshot are **not** sent on
 the model that happens to be loaded. The card says so, keeps your draft, and waits for you.
+
+**Choosing for you.** With *Choose models for me* on, a tier you leave empty is
+picked from pi's catalog inside limits you set in `~/.config/omassistant/config.json`:
+
+```json
+{
+  "autoPicks": true,
+  "guardrails": { "maxCostPerMTok": 2, "minContext": 128000, "providers": ["openrouter"] }
+}
+```
+
+The limits are a price ceiling per million tokens (input + output, as pi reports
+it), a minimum context, and the providers you are willing to use. *Keep everything
+on this computer* counts as one more guardrail. A tier you filled in yourself is
+never overridden — it is your choice, and the row warns if it breaks one of the
+limits. The Screen model is picked with vision required, always: what sees is what
+drives.
 
 Local discovery probes only loopback addresses: Ollama on `127.0.0.1:11434`, LM Studio on
 `127.0.0.1:1234`, llama.cpp on `127.0.0.1:8080`. If you choose *Find local models*, Omassistant
 merges `omassistant-*` providers into pi's own `models.json` with a backup and mode 0600, then
 restarts pi once. It uses placeholder keys for those local providers; no real key is stored there.
+
+What goes into that file is deliberate, because pi's defaults are a lie about a small server:
+
+- **The window comes from the server.** llama.cpp answers `GET /props` with `n_ctx`; the entry gets
+  `contextWindow` from it and `maxTokens` at half of it. Without it pi assumes 128000 tokens, never
+  compacts, and llama.cpp truncates silently — the model looks stupid for reasons that are not the
+  model. No `/props` answer means no field, never a guess.
+- **Thinking can be turned off.** A hybrid thinking model (Qwen3.x) gets
+  `"reasoning": true, "compat": { "thinkingFormat": "qwen-chat-template" }`, which is the format
+  llama-server with `--jinja` honours. Without it `--thinking off` is a silent no-op and a trivial
+  answer costs five times the tokens.
+- **The file is validated before it is replaced.** pi reads `models.json` all-or-nothing: one bad
+  value removes *every* provider, including the cloud ones. The entries this plugin writes are
+  type-checked first, and if anything is off the file is left untouched and the sheet says why.
+- **An endpoint you already serve is not added twice.** If an existing provider (not ours) has the
+  same base URL and at least one of the same models, nothing new is written; only our own earlier
+  entry, if any, is refreshed.
 
 The COSTS sheet is computed from pi's session records: it sums `usage.cost.total` per message and
 per model, and reports what the provider recorded. Missing usage is $0, not an estimate, and the

@@ -64,12 +64,28 @@ Item {
   property string brokerSummary: ""
   property bool brokerActing: false
   property bool grantsOn: false
+  property bool trusted: false
   // The agent is acting: the sidebar stays, but the app owns the keyboard.
   property bool actingFocus: false
   // The model settings sheet, drawn lazily so a broken panel cannot take the
   // chat down with it.
   property bool settingsOpen: false
+  property bool welcomeOpen: false
+  property var welcomeState: ({})
   property var settingsState: ({})
+  property string webProvider: "keyless"
+  property bool webKeySet: false
+  // Questions already asked, newest last; and where Up has walked to.
+  property var sentHistory: []
+  // The picture a look would send, shown before it is approved.
+  property string brokerCapability: ""
+  property bool previewReady: false
+  property string previewUrl: ""
+  property string previewCaption: ""
+  // Pictures the search behind the last answer came with (club badges, mostly).
+  property var mediaImages: []
+  property int recallIndex: -1
+  property string recallDraft: ""
   property bool permissionsOpen: false
   property var permissionsState: ({})
   property bool costsOpen: false
@@ -80,9 +96,22 @@ Item {
   // the screenshot contains the window, not this overlay.
   property bool blank: false
   readonly property bool consentMode: root.lookState === "consent"
+  // One question at a time. The rows all fill the composer's slot, so more than
+  // one visible drew them on top of each other: "ENTER ALLOW · CTRL+P …" and
+  // "ENTER ALLOW · ESC DENY" landed in the same pixels. Priority: the agent's
+  // tool call (it is already waiting on us), then the card's own action, then a
+  // look. Each row's own visibility asks this.
+  readonly property bool lookConsentVisible: root.consentMode && !root.brokerConfirm
+    && !root.actionConfirm
+  readonly property bool actionConfirmVisible: root.actionConfirm && !root.brokerConfirm
+  readonly property bool anyConsent: root.brokerConfirm || root.actionConfirm || root.consentMode
   readonly property bool looking: root.lookState === "looking"
 
   signal submitted(string text)
+  signal welcomeClosed()
+  signal welcomeAsked(string prompt)
+  signal welcomeRequested()
+  signal settingsAutoPicksChanged(bool on)
   signal dismissed()
   signal aborted()
   signal cleared()
@@ -100,6 +129,13 @@ Item {
   signal settingsClosed()
   signal settingsModelChosen(string role, string provider, string id)
   signal settingsAutoChanged(bool on)
+  signal settingsWebProviderChosen(string provider)
+  // A click on the card is a request for the keyboard, even while an action has
+  // it: the card must never be a window with no way back in.
+  signal actingFocusRelease()
+  signal previewRequested()
+  signal settingsWebKeySaved(string key)
+  signal settingsTrustChanged(bool on)
   signal settingsLocalOnlyChanged(bool on)
   signal settingsDiscover()
   signal settingsRefresh()
@@ -146,8 +182,8 @@ Item {
   // Transcript type: a fixed leading keeps a long answer compact and predictable
   // whatever family the theme resolves "monospace" to.
   readonly property int bodyFontSize: Style.font.title
-  readonly property int bodyLeading: Style.space(20)
-  readonly property int questionLeading: Style.space(19)
+  readonly property int bodyLeading: Math.round(root.bodyFontSize * 1.45)
+  readonly property int questionLeading: Math.round(root.bodyFontSize * 1.35)
 
   readonly property real cardWidth: Math.max(Style.space(380),
     Math.min(Style.space(560), root.width * 0.38))
@@ -203,6 +239,26 @@ Item {
   // the moment the run ends instead of leaving it at whatever alpha.
   onBusyChanged: if (!busy) statusDot.opacity = 1
 
+  // Clicking anywhere on the card is a request for the keyboard, which matters
+  // exactly when an action took it away.
+  MouseArea {
+    anchors.fill: parent
+    z: -1
+    onClicked: if (root.actingFocus) root.actingFocusRelease()
+  }
+
+  // Anything with focus that does not use Escape itself bubbles it here. Without
+  // this, Escape only worked while a sheet was open, and a card whose focus
+  // landed nowhere could not be closed from the keyboard at all.
+  Keys.onPressed: function(event) {
+    if (event.key !== Qt.Key_Escape) return
+    if (root.lookConsentVisible || root.brokerConfirm || root.actionConfirm) return
+    if (root.settingsOpen || root.permissionsOpen || root.costsOpen) return
+    if (root.welcomeOpen) root.welcomeClosed()
+    else root.dismissed()
+    event.accepted = true
+  }
+
   onActionStateChanged: {
     if (root.settingsOpen || root.permissionsOpen || root.costsOpen) return
     if (root.actionConfirm) Qt.callLater(function() { actionRow.forceActiveFocus() })
@@ -210,6 +266,8 @@ Item {
   }
 
   onBrokerConfirmChanged: {
+    // Show the pixels before the approval, not after the answer.
+    if (root.brokerConfirm) root.previewRequested()
     if (root.settingsOpen || root.permissionsOpen || root.costsOpen) return
     if (root.brokerConfirm) Qt.callLater(function() { brokerRow.forceActiveFocus() })
     else if (!root.actionMode) Qt.callLater(function() { root.focusComposer() })
@@ -259,11 +317,47 @@ Item {
   }
 
   function focusComposer() {
-    if (root.active && !root.settingsOpen && !root.permissionsOpen && !root.costsOpen
-        && !root.actingFocus) {
+    if (root.actingFocus) {
+      root.actingFocusRelease()
+      return
+    }
+    if (root.active && !root.settingsOpen && !root.permissionsOpen && !root.costsOpen) {
       if (root.setupMode) setupPane.forceActiveFocus()
       else input.forceActiveFocus()
     }
+  }
+
+  // Up in an empty composer is "what did I just ask", like a shell. With text in
+  // the field it keeps scrolling the transcript, so reading never loses the
+  // draft.
+  function recallPrevious() {
+    var list = root.sentHistory || []
+    if (!list.length) return false
+    if (root.recallIndex < 0) {
+      root.recallDraft = input.text
+      root.recallIndex = list.length - 1
+    } else if (root.recallIndex > 0) {
+      root.recallIndex -= 1
+    } else {
+      return false
+    }
+    input.text = String(list[root.recallIndex] || "")
+    input.cursorPosition = input.text.length
+    return true
+  }
+
+  function recallNext() {
+    var list = root.sentHistory || []
+    if (root.recallIndex < 0) return false
+    root.recallIndex += 1
+    if (root.recallIndex >= list.length) {
+      root.recallIndex = -1
+      input.text = root.recallDraft
+    } else {
+      input.text = String(list[root.recallIndex] || "")
+    }
+    input.cursorPosition = input.text.length
+    return true
   }
 
   function setDraft(text) {
@@ -273,6 +367,8 @@ Item {
   }
 
   function sendDraft() {
+    root.recallIndex = -1
+    root.recallDraft = ""
     if (root.historyMode) return
     var text = String(input.text || "").replace(/\s+$/, "")
     if (!text.length) return
@@ -296,7 +392,13 @@ Item {
   property bool nudge: false
 
   function scrollToEnd() {
-    scroller.contentY = Math.max(0, scroller.contentHeight - scroller.height)
+    var go = function() {
+      scroller.contentY = Math.max(0, scroller.contentHeight - scroller.height)
+    }
+    go()
+    // A delegate that just grew reports its height on the next turn; without this
+    // the last line stays half under the composer while an answer streams in.
+    Qt.callLater(go)
   }
 
   function scrollBy(amount) {
@@ -369,7 +471,9 @@ Item {
     y: Math.round(root.topMargin)
     width: root.cardWidth
     height: root.cardHeight
-    color: Commons.Util.alpha(root.surface, 0.94)
+    // The theme decides the card's opacity (its menu surface); multiplying it
+    // down here is what made the chat translucent over a busy window.
+    color: root.surface
     borderSpec: root.borderSpec
     padding: root.contentMargin
 
@@ -422,14 +526,23 @@ Item {
           font.letterSpacing: 1.6
         }
 
-        Item {
+        // The same control height as the state pill beside it: STOP was a bare
+        // 18px word next to a bordered pill, which read as two different toolbars.
+        BorderSurface {
           id: stopButton
           anchors.right: settingsButton.left
-          anchors.rightMargin: Style.space(12)
+          anchors.rightMargin: Style.space(10)
           anchors.verticalCenter: parent.verticalCenter
-          width: Math.max(Style.space(34), stopText.implicitWidth + Style.space(8))
-          height: Style.space(18)
+          implicitWidth: Math.max(Style.space(38), stopText.implicitWidth
+            + Style.spacing.controlPaddingX * 2)
+          implicitHeight: stopText.implicitHeight + Style.spacing.controlPaddingY * 2
           visible: root.busy
+          color: stopMouse.containsMouse
+            ? Commons.Util.alpha(root.urgent, 0.16) : "transparent"
+          borderSpec: Border.controlSpec("normal", root.foreground, root.accent, root.urgent)
+          radius: root.cornerRadius
+          Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+
           Text {
             id: stopText
             anchors.centerIn: parent
@@ -783,10 +896,50 @@ Item {
             width: parent.width
             wrapMode: Text.Wrap
             textFormat: Text.PlainText
-            text: "It can look at your screen, type, press keys and run desktop actions — after you allow it."
+            text: "Look at what is on screen, open an app, run a command, act in a window — each one after you allow it."
             color: root.textSecondary
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
+            lineHeight: 1.35
+          }
+
+          // Concrete starters. A blank card asks the person to invent the first
+          // question; these are the ones that show what the thing is for.
+          Repeater {
+            model: [
+              "What does this window show, and what does the error mean?",
+              "Open the file manager and make three folders in Documents",
+              "Sort my Downloads into folders by file type"
+            ]
+
+            delegate: Item {
+              required property int index
+              required property string modelData
+              width: parent.width
+              height: starterText.implicitHeight + Style.space(6)
+
+              Text {
+                id: starterText
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
+                text: "›  " + parent.modelData
+                color: starterMouse.containsMouse ? root.accent : root.textSecondary
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+                Behavior on color { ColorAnimation { duration: Style.duration(120) } }
+              }
+
+              MouseArea {
+                id: starterMouse
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.submitted(parent.modelData)
+              }
+            }
           }
 
           Text {
@@ -799,6 +952,10 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
+
+          // Air between the starters and the links: they are two different kinds
+          // of thing, and six pixels said they were one list.
+          Item { width: 1; height: Style.space(6) }
 
           Row {
             spacing: Style.space(18)
@@ -860,6 +1017,9 @@ Item {
         Flickable {
           id: scroller
           anchors.fill: parent
+          // The look preview sits in the gap above the composer; the transcript
+          // yields its space instead of being drawn over.
+          anchors.bottomMargin: previewStrip.visible ? previewStrip.height + Style.space(8) : 0
           visible: root.bodyContentHeight > 0 && !root.historyMode && !root.setupMode
           clip: true
           boundsBehavior: Flickable.StopAtBounds
@@ -873,6 +1033,15 @@ Item {
             id: transcriptColumn
             width: scroller.width
             spacing: root.messageGap
+
+            // A little air under the last line, so "scrolled to the end" does not
+            // leave a clipped half-line against the composer.
+            // Only when there is something above it: an empty column with a spacer
+            // is "content", which hid the empty state.
+            Item {
+              width: 1
+              height: root.transcript && root.transcript.count > 0 ? root.sectionGap : 0
+            }
 
             Repeater {
               model: root.transcript
@@ -1059,6 +1228,11 @@ Item {
               anchors.right: parent.right
               anchors.rightMargin: Style.spacing.rowPaddingX
               anchors.verticalCenter: parent.verticalCenter
+              // A fixed meta column, right-aligned: right-aligning by content made
+              // the "when · turns" column start at a different x on every row.
+              width: Math.round((parent.width - Style.spacing.rowPaddingX * 2) * 0.46)
+              horizontalAlignment: Text.AlignRight
+              elide: Text.ElideLeft
               textFormat: Text.PlainText
               text: (historyRow.current ? "now  ·  " : "") + historyRow.when
                 + (historyRow.turns > 0 ? "  ·  " + historyRow.turns + (historyRow.turns === 1 ? " turn" : " turns") : "")
@@ -1128,12 +1302,119 @@ Item {
         anchors.bottomMargin: Style.spacing.md
         height: root.setupMode ? 0 : root.composerHeight
 
+        // Where the last answer came from: the search returned these with it.
+        // Small enough to be a footnote, real enough to be worth showing.
+        Item {
+          id: mediaStrip
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.bottom
+          anchors.bottomMargin: -Style.space(4)
+          height: visible ? Style.space(30) : 0
+          visible: !root.blank && !root.busy && root.mediaImages.length > 0
+            && !root.brokerConfirm && !root.lookConsentVisible
+
+          Row {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(6)
+
+            Repeater {
+              model: Math.min(root.mediaImages.length, 4)
+              delegate: Rectangle {
+                width: Style.space(22)
+                height: width
+                radius: Style.space(3)
+                color: "transparent"
+                border.color: Commons.Util.alpha(root.foreground, 0.18)
+                border.width: 1
+                clip: true
+
+                Image {
+                  anchors.fill: parent
+                  anchors.margins: 2
+                  asynchronous: true
+                  fillMode: Image.PreserveAspectFit
+                  source: root.mediaImages[index] ? String(root.mediaImages[index].url || "") : ""
+                }
+              }
+            }
+          }
+
+          Text {
+            anchors.left: parent.left
+            anchors.leftMargin: Math.min(root.mediaImages.length, 4) * Style.space(28)
+            anchors.verticalCenter: parent.verticalCenter
+            textFormat: Text.PlainText
+            text: "FROM THE SEARCH"
+            color: root.textTertiary
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.letterSpacing: 0.8
+          }
+        }
+
+        // What the model is about to look at, above the question about looking.
+        Item {
+          id: previewStrip
+          anchors.left: parent.left
+          anchors.right: parent.right
+          anchors.bottom: parent.top
+          anchors.bottomMargin: Style.space(8)
+          height: visible ? Style.space(140) : 0
+          visible: root.brokerConfirm && root.previewReady && !root.blank
+
+          Rectangle {
+            id: previewFrame
+            anchors.left: parent.left
+            anchors.top: parent.top
+            width: Style.space(240)
+            height: parent.height
+            color: "transparent"
+            border.color: Commons.Util.alpha(root.foreground, 0.16)
+            border.width: 1
+            radius: Style.space(4)
+            clip: true
+
+            Image {
+              id: previewImage
+              anchors.fill: parent
+              anchors.margins: 1
+              fillMode: Image.PreserveAspectCrop
+              asynchronous: true
+              cache: false
+              source: root.previewUrl
+            }
+          }
+
+          Text {
+            anchors.left: previewFrame.right
+            anchors.leftMargin: Style.space(12)
+            anchors.right: parent.right
+            anchors.top: previewFrame.top
+            textFormat: Text.PlainText
+            text: "WHAT IT WILL SEE\n" + root.previewCaption
+            color: root.textTertiary
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.letterSpacing: 0.6
+            lineHeight: 1.4
+            wrapMode: Text.Wrap
+            elide: Text.ElideRight
+            maximumLineCount: 3
+          }
+        }
+
         // Consent is a mode of the card, not a dialog: one row, one decision,
         // the same keys as everything else (Enter allows, Esc backs out).
         Item {
           id: consentRow
           anchors.fill: parent
-          visible: root.consentMode
+          z: 1
+          // Its own surface: the row shares the composer's slot, and the
+          // composer's controls must not show through the question.
+          Rectangle { anchors.fill: parent; color: root.surface; z: -1 }
+          visible: root.lookConsentVisible
           focus: visible
 
           Keys.onPressed: function(event) {
@@ -1204,6 +1485,10 @@ Item {
         Item {
           id: brokerRow
           anchors.fill: parent
+          z: 3
+          // Its own surface: the row shares the composer's slot, and the
+          // composer's controls must not show through the question.
+          Rectangle { anchors.fill: parent; color: root.surface; z: -1 }
           visible: root.brokerConfirm
           focus: visible
 
@@ -1262,7 +1547,11 @@ Item {
         Item {
           id: actionRow
           anchors.fill: parent
-          visible: root.actionConfirm
+          z: 2
+          // Its own surface: the row shares the composer's slot, and the
+          // composer's controls must not show through the question.
+          Rectangle { anchors.fill: parent; color: root.surface; z: -1 }
+          visible: root.actionConfirmVisible
           focus: visible
 
           Keys.onPressed: function(event) {
@@ -1394,7 +1683,7 @@ Item {
 
         Text {
           id: promptGlyph
-          visible: !root.actionMode && !root.brokerConfirm && (root.lookState === "" || root.lookState === "attached")
+          visible: !root.anyConsent && (root.lookState === "" || root.lookState === "attached")
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
           textFormat: Text.PlainText
@@ -1413,7 +1702,7 @@ Item {
           anchors.right: lookButton.left
           anchors.rightMargin: Style.space(10)
           anchors.verticalCenter: parent.verticalCenter
-          visible: !root.actionMode && !root.brokerConfirm && (root.lookState === "" || root.lookState === "attached")
+          visible: !root.anyConsent && (root.lookState === "" || root.lookState === "attached")
             && input.text.length === 0 && input.preeditText.length === 0
           textFormat: Text.PlainText
           text: root.historyMode ? "choose a conversation"
@@ -1429,7 +1718,7 @@ Item {
 
         TextInput {
           id: input
-          visible: !root.actionMode && !root.brokerConfirm && (root.lookState === "" || root.lookState === "attached")
+          visible: !root.anyConsent && (root.lookState === "" || root.lookState === "attached")
           anchors.left: promptGlyph.right
           anchors.leftMargin: Style.space(10)
           anchors.right: lookButton.left
@@ -1554,10 +1843,23 @@ Item {
               return
             }
             if (event.key === Qt.Key_Up) {
+              // Empty composer: walk back through what was asked. Otherwise the
+              // arrow belongs to the transcript.
+              if (input.text.length === 0 || root.recallIndex >= 0) {
+                if (root.recallPrevious()) {
+                  event.accepted = true
+                  return
+                }
+              }
               root.follow = false
               root.scrollBy(-Style.space(48))
               event.accepted = true
             } else if (event.key === Qt.Key_Down) {
+              if (root.recallIndex >= 0) {
+                root.recallNext()
+                event.accepted = true
+                return
+              }
               root.scrollBy(Style.space(48))
               if (scroller.contentY + scroller.height >= scroller.contentHeight - 1) root.follow = true
               event.accepted = true
@@ -1673,6 +1975,9 @@ Item {
         source: "SettingsPanel.qml"
         onLoaded: {
           item.state = Qt.binding(function() { return root.settingsState })
+          item.webProvider = Qt.binding(function() { return root.webProvider })
+          item.webKeySet = Qt.binding(function() { return root.webKeySet })
+          item.trusted = Qt.binding(function() { return root.trusted })
           item.locked = Qt.binding(function() { return root.busy })
           item.forceActiveFocus()
         }
@@ -1689,11 +1994,39 @@ Item {
           root.settingsModelChosen(role, provider, id)
         }
         function onSetAuto(on) { root.settingsAutoChanged(on) }
+        function onSetWebProvider(provider) { root.settingsWebProviderChosen(provider) }
+        function onSaveWebKey(key) { root.settingsWebKeySaved(key) }
+        function onSetTrust(on) { root.settingsTrustChanged(on) }
+        function onSetAutoPicks(on) { root.settingsAutoPicksChanged(on) }
         function onSetLocalOnly(on) { root.settingsLocalOnlyChanged(on) }
         function onSetDesktopWidget(on) { root.settingsDesktopChanged(on) }
+        function onWelcomeRequested() { root.welcomeRequested() }
         function onOpenCosts() { root.costsRequested() }
         function onDiscover() { root.settingsDiscover() }
         function onRefresh() { root.settingsRefresh() }
+      }
+
+      Loader {
+        id: welcomeLoader
+        anchors.fill: parent
+        active: root.welcomeOpen
+        visible: active
+        source: "Welcome.qml"
+        onLoaded: {
+          item.state = Qt.binding(function() { return root.welcomeState })
+          item.forceActiveFocus()
+        }
+        onStatusChanged: {
+          if (status === Loader.Error && root.welcomeOpen) root.welcomeClosed()
+        }
+      }
+
+      Connections {
+        target: welcomeLoader.item
+        enabled: welcomeLoader.status === Loader.Ready
+        function onClose() { root.welcomeClosed() }
+        function onAsk(prompt) { root.welcomeAsked(prompt) }
+        function onSettings() { root.settingsRequested() }
       }
 
       Loader {
@@ -1757,8 +2090,10 @@ Item {
     if (root.historyMode) return "↑↓ CHOOSE  ·  ENTER RESUME  ·  ESC BACK"
     if (root.busy) return "WORKING  ·  STOP  ·  SUPER+ALT+ESC  ·  ESC"
     var base = "ENTER  ·  ESC"
+    // The card is 547px wide: three spelled-out shortcuts plus the model name do
+    // not fit, and the hint elided to "…" (LOOK lives on the composer anyway).
     if (root.transcript && root.transcript.count > 0)
-      base = "CTRL+K NEW  ·  CTRL+H HISTORY  ·  CTRL+O LOOK  ·  ESC"
+      base = "CTRL+K NEW  ·  CTRL+H HISTORY  ·  ESC"
     return base
   }
 
@@ -1798,6 +2133,8 @@ Item {
       return label
     }
     if (root.runtimeLive) {
+      // Trusted is a stronger statement than a grant with minutes left.
+      if (root.trusted) return "TRUSTED ›"
       if (root.grantsOn) return (root.grantLabel.length ? root.grantLabel : "ALLOWED") + " ›"
       return "ASK FIRST ›"
     }

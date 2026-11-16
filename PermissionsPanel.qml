@@ -119,9 +119,44 @@ FocusScope {
     anchors.right: parent.right
     height: Style.space(28)
 
-    Text {
+    // A back affordance, not only the Esc key: the sheets are the one place a
+    // person can end up somewhere they did not mean to be.
+    Item {
+      id: backButton
       anchors.left: parent.left
       anchors.top: parent.top
+      width: Style.space(22)
+      height: Style.space(22)
+
+      Rectangle {
+        anchors.fill: parent
+        radius: Style.space(4)
+        color: backMouse.containsMouse ? Commons.Color.menu.selectedBackground : "transparent"
+      }
+
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: "‹"
+        color: backMouse.containsMouse ? root.accent : root.textSecondary
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      MouseArea {
+        id: backMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: root.close()
+      }
+    }
+
+    Text {
+      anchors.left: backButton.right
+      anchors.leftMargin: Style.space(8)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(3)
       textFormat: Text.PlainText
       text: "PERMISSIONS"
       color: root.foreground

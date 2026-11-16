@@ -43,6 +43,7 @@ pub mod launch;
 pub mod paths;
 pub mod protocol;
 pub mod server;
+pub mod web;
 
 /// The daemon version, from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

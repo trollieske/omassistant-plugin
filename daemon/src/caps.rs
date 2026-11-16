@@ -72,6 +72,16 @@ pub const SHELL_EXEC: Capability = Capability {
     description: "Run one command in your shell (with your permissions, never root)",
 };
 
+/// `web.search`: look something up on the internet without touching the screen.
+/// Reading a page as a screenshot to answer "what was the result" is slow, costs a
+/// vision call and looks limited; this is the background route. The consent row
+/// shows the query, because a query can carry something the person did not mean to
+/// publish, and the audit keeps the host and the length, never the words.
+pub const WEB_SEARCH: Capability = Capability {
+    name: "web.search",
+    description: "Look something up on the web and read a public page",
+};
+
 /// Everything this daemon implements. The browser and mail are not here.
 pub const CAPABILITIES: &[Capability] = &[
     OBSERVE_SCREEN,
@@ -82,6 +92,7 @@ pub const CAPABILITIES: &[Capability] = &[
     ACT_LAUNCH,
     SHELL_RUN,
     SHELL_EXEC,
+    WEB_SEARCH,
 ];
 
 /// Look a capability up by its wire name.
@@ -98,7 +109,7 @@ mod tests {
 
     #[test]
     fn the_registry_is_the_m2_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 8);
+        assert_eq!(CAPABILITIES.len(), 9);
         let capability = find("observe.screen").unwrap();
         assert_eq!(capability.name, "observe.screen");
         assert_eq!(

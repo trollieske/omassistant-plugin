@@ -55,6 +55,8 @@ usage: omassistantctl [--socket <path>] [--state-dir <path>] [--json] <command>
   act.launch --app <id>                 open any installed app by its desktop id
   app.list                              installed apps: id and display name
   shell.exec -- <command>               run one command in your shell (asks the card)
+  web.search <query>                    look something up on the web (asks the card)
+  web.fetch <url>                       read one public page as text
   shell.run <action>                    run one named desktop action
                                         (lock, volume-up, volume-down, volume-mute,
                                          brightness-up, brightness-down, next-workspace,
@@ -69,6 +71,11 @@ usage: omassistantctl [--socket <path>] [--state-dir <path>] [--json] <command>
   consent revoke-all                    every grant, and fail waiting confirmations
   audit [--lines N]                     the last audit entries, newest last (1..200)
   costs [--json]                        usage and cost from pi's session files (no daemon needed)
+  web.config --provider <name>          set the web search provider (keyless, you, brave,
+                                        tavily, serper); the key is read from stdin
+  web.status                            which provider answers, and whether a key is set
+  web.last                              the pictures the last search came with
+  trust on|off|status                   stop asking on this machine (still audited)
 
   --socket <path>     talk to this socket instead of $XDG_RUNTIME_DIR/omassistantd.sock
   --state-dir <path>  the state directory (only used to resolve defaults)
@@ -83,7 +90,9 @@ has focus, so close the overlay before calling. The daemon holds the grants, the
 captures.";
 
 const SCAN: ScanSpec = ScanSpec {
-    boolean: &["help", "version", "json", "once", "allow", "deny"],
+    boolean: &[
+        "help", "version", "json", "once", "allow", "deny", "key-set",
+    ],
     valued: &[
         "socket",
         "state-dir",
@@ -94,6 +103,8 @@ const SCAN: ScanSpec = ScanSpec {
         "app",
         "cwd",
         "timeout",
+        "provider",
+        "key",
     ],
 };
 
@@ -143,6 +154,123 @@ fn run() -> Result<(), Failure> {
     )
     .map_err(|err| Failure::Failed(err.message().to_string()))?;
     let json = scanned.has("json");
+
+    if command == "trust" {
+        let mode = arguments.first().map(String::as_str).unwrap_or("status");
+        let path = paths.state_dir().join("trust.json");
+        match mode {
+            "status" => {
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                let on = serde_json::from_str::<serde_json::Value>(&raw)
+                    .ok()
+                    .and_then(|value| value.get("allowAll").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
+                if json {
+                    print_json(&serde_json::json!({ "allowAll": on }))?;
+                } else {
+                    println!(
+                        "{}",
+                        if on {
+                            "trusted: nothing asks on this machine, everything is audited"
+                        } else {
+                            "not trusted: every capability asks the card first"
+                        }
+                    );
+                }
+            }
+            "on" | "off" => {
+                use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+                std::fs::create_dir_all(paths.state_dir()).map_err(|err| {
+                    Failure::Failed(format!("could not create the state directory: {err}"))
+                })?;
+                let on = mode == "on";
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|err| Failure::Failed(format!("could not write {path:?}: {err}")))?;
+                use std::io::Write;
+                file.write_all(serde_json::json!({ "allowAll": on }).to_string().as_bytes())
+                    .map_err(|err| Failure::Failed(format!("could not write {path:?}: {err}")))?;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|err| Failure::Failed(format!("could not chmod {path:?}: {err}")))?;
+                if on {
+                    println!("trusted: nothing asks on this machine. Every call is still audited.");
+                } else {
+                    println!("not trusted: every capability asks the card first again.");
+                }
+            }
+            other => {
+                return Err(Failure::Usage(format!(
+                    "trust takes on, off or status, not \"{other}\""
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    // The search provider config is a local file; no daemon socket required.
+    if command == "web.config" {
+        let provider = scanned.value("provider").unwrap_or("keyless").to_string();
+        let Some(provider) = omassistantd::web::Provider::parse(&provider) else {
+            return Err(Failure::Usage(format!(
+                "\"{provider}\" is not a search provider; use keyless, you, brave, tavily or serper"
+            )));
+        };
+        // The key arrives on stdin so it never appears in `ps` or a shell history.
+        let mut key = String::new();
+        if provider != omassistantd::web::Provider::Keyless {
+            if scanned.has("key-set") || scanned.has("key") {
+                key = scanned.value("key").unwrap_or_default().to_string();
+            } else {
+                // One line: the caller writes the key and keeps its side of the
+                // pipe open, so reading to EOF would wait for a close that never
+                // comes.
+                use std::io::BufRead;
+                std::io::stdin()
+                    .lock()
+                    .read_line(&mut key)
+                    .map_err(|err| Failure::Failed(format!("could not read the key: {err}")))?;
+            }
+            key = key.trim().to_string();
+            if key.is_empty() {
+                return Err(Failure::Usage(
+                    "a key is required for that provider; pipe it on stdin".to_string(),
+                ));
+            }
+        }
+        omassistantd::web::write_config(
+            paths.state_dir(),
+            &omassistantd::web::Config { provider, key },
+        )
+        .map_err(|err| Failure::Failed(format!("could not write the config: {err}")))?;
+        println!("web search: {} ({})", provider.name(), provider.host());
+        return Ok(());
+    }
+    if command == "web.status" {
+        let config = omassistantd::web::load_config(paths.state_dir());
+        if json {
+            print_json(&serde_json::json!({
+                "provider": config.provider.name(),
+                "host": config.provider.host(),
+                "keySet": !config.key.is_empty(),
+            }))?;
+        } else {
+            println!(
+                "{} ({}), key {}",
+                config.provider.name(),
+                config.provider.host(),
+                if config.key.is_empty() {
+                    "not set"
+                } else {
+                    "set"
+                }
+            );
+        }
+        return Ok(());
+    }
 
     // Costs are a local report from pi's own files; no daemon socket required.
     if command == "costs" {
@@ -236,6 +364,61 @@ fn run() -> Result<(), Failure> {
             }
         }
         "act.clipboard" => act_clipboard(&mut client, &scanned, &arguments, json)?,
+        "web.search" => {
+            let query = arguments.join(" ");
+            let mut params = json!({ "query": query });
+            if let Some(text) = scanned.value("text") {
+                params["query"] = json!(text);
+            }
+            let result = call(&mut client, "web.search", Some(&params))?;
+            if json {
+                print_json(&result)?;
+            } else {
+                let hits = result["results"].as_array().cloned().unwrap_or_default();
+                if hits.is_empty() {
+                    println!("nothing found");
+                }
+                for hit in hits {
+                    println!(
+                        "{}\t{}\t[{}]",
+                        text(&hit, "when"),
+                        text(&hit, "title"),
+                        text(&hit, "source")
+                    );
+                    let snippet = text(&hit, "snippet");
+                    if !snippet.is_empty() {
+                        println!("\t{snippet}");
+                    }
+                    println!("\t{}", text(&hit, "url"));
+                }
+            }
+        }
+        "web.last" => {
+            let result = call(&mut client, "web.last", None)?;
+            if json {
+                print_json(&result)?;
+            } else {
+                let images = result["images"].as_array().cloned().unwrap_or_default();
+                if images.is_empty() {
+                    println!("no pictures from the last search");
+                }
+                for image in images {
+                    println!("{}\t{}", text(&image, "host"), text(&image, "url"));
+                }
+            }
+        }
+        "web.fetch" => {
+            let url = arguments
+                .first()
+                .cloned()
+                .ok_or_else(|| Failure::Usage("web.fetch needs a URL".to_string()))?;
+            let result = call(&mut client, "web.fetch", Some(&json!({ "url": url })))?;
+            if json {
+                print_json(&result)?;
+            } else {
+                println!("{}", text(&result, "text"));
+            }
+        }
         "shell.run" => {
             let action = arguments.first().ok_or_else(|| {
                 Failure::Usage(

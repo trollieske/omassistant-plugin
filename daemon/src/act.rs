@@ -351,6 +351,283 @@ impl Actor {
         self.spawn(program, args, name)
     }
 
+    /// Search the web. Capability `web.search`.
+    ///
+    /// With a provider key this is one request to a real index, and a second one
+    /// with the asking words removed only if the first found nothing. Without a
+    /// key it is the news feed and the encyclopedia, asked in parallel.
+    ///
+    /// The second return value names the sources that failed, so a half answer is
+    /// reported as half an answer.
+    pub fn search(
+        &self,
+        provider: crate::web::Provider,
+        key: &str,
+        query: &str,
+    ) -> Result<(Vec<crate::web::Hit>, Vec<String>), ApiError> {
+        if provider != crate::web::Provider::Keyless {
+            let request = crate::web::build(provider, key, query);
+            let hits = self.run_request(provider, &request)?;
+            if !hits.is_empty() {
+                return Ok((hits, Vec::new()));
+            }
+            // "hvor mange innbyggere har Bergen" is a question; "Bergen" is a
+            // query. Try the query before telling the person there is nothing.
+            if let Some(keywords) = crate::web::keywords(query) {
+                let retry = crate::web::build(provider, key, &keywords);
+                let hits = self.run_request(provider, &retry)?;
+                if !hits.is_empty() {
+                    return Ok((hits, Vec::new()));
+                }
+            }
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // No key: both free indexes at once. One after the other would double the
+        // wait, and the person is asking a question, not watching a pipeline.
+        let (news, wiki) = std::thread::scope(|scope| {
+            let news = scope
+                .spawn(|| self.run_request(provider, &crate::web::build(provider, key, query)));
+            let wiki = scope.spawn(|| self.search_wikipedia(query));
+            (
+                news.join().unwrap_or_else(|_| {
+                    Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the news index panicked",
+                    ))
+                }),
+                wiki.join().unwrap_or_else(|_| {
+                    Err(ApiError::new(
+                        ErrorCode::Unavailable,
+                        "the encyclopedia panicked",
+                    ))
+                }),
+            )
+        });
+        // A half answer is still an answer, but the caller has to know which half
+        // is missing: "nothing found" and "one index failed" are different facts.
+        let mut missing = Vec::new();
+        let mut hits = match (news, wiki) {
+            (Ok(mut news), Ok(wiki)) => {
+                news.extend(wiki);
+                news
+            }
+            (Ok(news), Err(error)) => {
+                missing.push(format!("the encyclopedia: {error}"));
+                news
+            }
+            (Err(error), Ok(wiki)) => {
+                missing.push(format!("the news index: {error}"));
+                wiki
+            }
+            (Err(news), Err(wiki)) => {
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    format!("neither index answered — news: {news}; wiki: {wiki}"),
+                ));
+            }
+        };
+        // An article and a headline for the same thing are one result.
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|hit| seen.insert(hit.url.clone()));
+        // News first when both have something: "what happened" is the question a
+        // person asks aloud most often. But a news index answers with a headline
+        // and no text, while an article answers with its opening paragraph, so the
+        // articles get a fixed share of the list rather than the leftovers.
+        hits.sort_by_key(|hit| u8::from(hit.source != "news"));
+        let mut news_slots = 0;
+        let mut wiki_slots = 0;
+        hits.retain(|hit| {
+            if hit.source == "news" {
+                news_slots += 1;
+                news_slots <= 4
+            } else {
+                wiki_slots += 1;
+                wiki_slots <= 4
+            }
+        });
+        Ok((hits, missing))
+    }
+
+    /// Run one provider request and parse it.
+    fn run_request(
+        &self,
+        provider: crate::web::Provider,
+        request: &crate::web::Request,
+    ) -> Result<Vec<crate::web::Hit>, ApiError> {
+        let max_bytes = crate::web::MAX_BODY_BYTES.to_string();
+        let mut args: Vec<&str> = vec![
+            "--disable",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--location",
+            "--connect-timeout",
+            "4",
+            "--max-time",
+            "10",
+            "--max-filesize",
+            &max_bytes,
+            "--compressed",
+            "--user-agent",
+            crate::web::USER_AGENT,
+        ];
+        if let Some(header) = request.header.as_deref() {
+            args.push("-H");
+            args.push(header);
+        }
+        if request.body.is_some() {
+            args.push("-H");
+            args.push("Content-Type: application/json");
+            args.push("--data-binary");
+            args.push("@-");
+        }
+        args.push("--");
+        args.push(&request.url);
+        let output = match request.body.as_deref() {
+            Some(body) => self.runner.run_with_input(
+                "curl",
+                &args,
+                body.as_bytes(),
+                Duration::from_secs(20),
+            )?,
+            None => self.runner.run("curl", &args, Duration::from_secs(20))?,
+        };
+        if output.status != Some(0) {
+            let status = output.status.unwrap_or(-1);
+            let detail = one_line(&String::from_utf8_lossy(&output.stderr), 160);
+            // A refusal from the search API is usually the key, and the person can
+            // fix that; say so instead of "unavailable".
+            let message = if status == 22 && detail.contains("401") {
+                "the search service refused the API key".to_string()
+            } else if status == 22 && detail.contains("403") {
+                "the search service refused the request (403)".to_string()
+            } else if status == 22 && detail.contains("429") {
+                "the search service is rate limiting this key".to_string()
+            } else {
+                format!("the search service did not answer (curl exit {status}): {detail}")
+            };
+            return Err(ApiError::new(ErrorCode::Unavailable, message));
+        }
+        crate::web::parse_results(provider, &String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Search the encyclopedia. Capability `web.search`; called by `web.search`.
+    ///
+    /// Two wikis, in parallel: the person's language and English. A Norwegian
+    /// question asked of the English encyclopedia finds nothing ("hvor mange
+    /// innbyggere har Bergen"), and the same question asked of the Norwegian one
+    /// finds the city.
+    pub fn search_wikipedia(&self, query: &str) -> Result<Vec<crate::web::Hit>, ApiError> {
+        let primary = crate::web::wiki_language();
+        let other = if primary == "en" { "no" } else { "en" };
+        let max_bytes = crate::web::MAX_BODY_BYTES.to_string();
+        let (here, there) = std::thread::scope(|scope| {
+            let here = scope.spawn(|| self.get_wiki(primary, query, &max_bytes));
+            let there = scope.spawn(|| self.get_wiki(other, query, &max_bytes));
+            (here.join().ok(), there.join().ok())
+        });
+        let mut hits = Vec::new();
+        let mut failure: Option<ApiError> = None;
+        for result in [here, there].into_iter().flatten() {
+            match result {
+                Ok(mut found) => hits.append(&mut found),
+                Err(error) => failure = Some(error),
+            }
+        }
+        if hits.is_empty() {
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        hits.retain(|hit| seen.insert(hit.url.clone()));
+        hits.truncate(4);
+        Ok(hits)
+    }
+
+    fn get_wiki(
+        &self,
+        language: &str,
+        query: &str,
+        max_bytes: &str,
+    ) -> Result<Vec<crate::web::Hit>, ApiError> {
+        let url = crate::web::wiki_url_in(language, query);
+        let output = self.runner.run(
+            "curl",
+            &[
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--location",
+                "--connect-timeout",
+                "4",
+                "--max-time",
+                "8",
+                "--max-filesize",
+                max_bytes,
+                "--compressed",
+                "--user-agent",
+                crate::web::USER_AGENT,
+                "--",
+                &url,
+            ],
+            Duration::from_secs(15),
+        )?;
+        if output.status != Some(0) {
+            return Err(ApiError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "the encyclopedia could not be reached (curl exit {}): {}",
+                    output.status.unwrap_or(-1),
+                    one_line(&String::from_utf8_lossy(&output.stderr), 160)
+                ),
+            ));
+        }
+        crate::web::parse_wiki(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    /// Read one public page as text. Capability `web.search`.    /// Read one public page as text. Capability `web.search`.
+    pub fn fetch_url(&self, url: &str) -> Result<String, ApiError> {
+        let max_bytes = crate::web::MAX_BODY_BYTES.to_string();
+        let output = self.runner.run(
+            "curl",
+            &[
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--location",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "15",
+                "--max-filesize",
+                &max_bytes,
+                "--compressed",
+                "--user-agent",
+                crate::web::USER_AGENT,
+                "--",
+                url,
+            ],
+            Duration::from_secs(25),
+        )?;
+        if output.status != Some(0) {
+            return Err(ApiError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "the page did not answer (curl exit {}): {}",
+                    output.status.unwrap_or(-1),
+                    one_line(&String::from_utf8_lossy(&output.stderr), 160)
+                ),
+            ));
+        }
+        Ok(crate::web::html_to_text(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
+    }
+
     /// Run one command line in the person's own shell, and return its output.
     ///
     /// `bash -lc` so the person's own aliases and PATH apply — this is meant to

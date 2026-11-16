@@ -30,8 +30,12 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 /// What a method needs from the outside world, injected so tests need no compositor.
+/// The scope trust mints its standing grants with. Nothing else uses it, which
+/// is what makes `trust off` able to take back exactly those and nothing more.
+const TRUST_SCOPE: &str = "trust";
+
 /// How long a pending confirmation waits for an answer before it is abandoned.
-const PENDING_WAIT_SECONDS: u64 = 55;
+const PENDING_WAIT_SECONDS: u64 = 120;
 /// How long a key-press approval lasts, and in which window. This is the
 /// ledger's minimum TTL (60 s): short enough to be a task, long enough for
 /// Tab/arrows/Enter navigation without a prompt per key.
@@ -93,8 +97,19 @@ pub struct Broker {
     pending: Mutex<BTreeMap<String, PendingRequest>>,
     /// Bumped by `consent.revoke_run`; a decision that crosses a bump cannot mint.
     run_epoch: AtomicU64,
+    /// The pictures the last search came with, and when it happened. The card
+    /// shows them under the answer; nothing else reads this.
+    last_media: Mutex<Option<LastSearch>>,
     pid: u32,
     started_at: OffsetDateTime,
+}
+
+/// What the last search showed, and when. In memory only, never audited: a
+/// thumbnail URL is content about what the person asked.
+#[derive(Debug, Clone)]
+struct LastSearch {
+    at: i64,
+    media: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Broker {
@@ -144,6 +159,7 @@ impl Broker {
             ledger: Mutex::new(ledger),
             pending,
             run_epoch: AtomicU64::new(0),
+            last_media: Mutex::new(None),
             pid: std::process::id(),
             started_at,
         })
@@ -176,6 +192,12 @@ impl Broker {
     pub fn handle(&self, request: Request) -> Response {
         let id = request.id.clone();
         let now = self.clock.now();
+        // Trusted machine: keep a standing grant for everything, so no call has to
+        // ask. Doing it here means flipping the switch takes effect on the next
+        // call, with no restart and no stale grant.
+        // A failure here is not fatal: the call still goes through normal consent,
+        // which is the safe direction.
+        let _ = self.ensure_trust(now.unix_timestamp());
         let result = match request.method.as_str() {
             "ping" => self.ping(),
             "capabilities" => self.capabilities(now),
@@ -188,6 +210,9 @@ impl Broker {
             "app.list" => self.app_list(),
             "shell.run" => self.shell_run(&request.params, now),
             "shell.exec" => self.shell_exec(&request.params, now),
+            "web.search" => self.web_search(&request.params, now),
+            "web.last" => self.web_last(),
+            "web.fetch" => self.web_fetch(&request.params, now),
             "consent.grant" => self.consent_grant(&request.params, now),
             "consent.revoke" => self.consent_revoke(&request.params, now),
             "consent.list" => self.consent_list(now),
@@ -201,7 +226,7 @@ impl Broker {
                 format!(
                     "unknown method \"{}\"; this daemon knows ping, capabilities, observe.screen, \
                      act.type, act.key, act.pointer, act.clipboard, act.launch, app.list, \
-                     shell.run, shell.exec, \
+                     shell.run, shell.exec, web.search, web.fetch, web.last, \
                      consent.grant, consent.revoke, \
                      consent.list, consent.pending, consent.decide, consent.revoke_run, \
                      consent.revoke_all and audit.tail",
@@ -225,6 +250,7 @@ impl Broker {
 
     fn capabilities(&self, now: OffsetDateTime) -> Result<Value, ApiError> {
         let now_unix = now.unix_timestamp();
+        self.ensure_trust(now_unix)?;
         let ledger = self.ledger();
         let mut list = Vec::with_capacity(caps::CAPABILITIES.len());
         for capability in caps::CAPABILITIES {
@@ -243,7 +269,7 @@ impl Broker {
                 "grant": grant,
             }));
         }
-        Ok(json!({ "capabilities": list }))
+        Ok(json!({ "capabilities": list, "trusted": self.trusted() }))
     }
 
     fn observe_screen(
@@ -791,6 +817,168 @@ impl Broker {
         }))
     }
 
+    /// `web.search`: look something up on the internet. Capability `web.search`.
+    fn web_search(
+        &self,
+        params: &Map<String, Value>,
+        now: OffsetDateTime,
+    ) -> Result<Value, ApiError> {
+        self.audited("web.search", now, |trace| {
+            trace.capability = Some(caps::WEB_SEARCH.name.to_string());
+            self.run_web_search(params, now, trace)
+        })
+    }
+
+    fn run_web_search(
+        &self,
+        params: &Map<String, Value>,
+        now: OffsetDateTime,
+        trace: &mut Trace,
+    ) -> Result<Value, ApiError> {
+        let query = required_text(params, "web.search", "query")?;
+        let query = crate::web::validate_query(query)?;
+        // The audit keeps the length, never the words: a search can carry a name,
+        // an address or a symptom, and writing that down is its own leak.
+        trace.action = Some("search".to_string());
+        trace.chars = Some(query.chars().count() as u64);
+
+        let summary = format!("Search the web for: {}", one_line(&query, 120));
+        let now_unix = now.unix_timestamp();
+        let grant = self.require_grant_interactive(
+            &caps::WEB_SEARCH,
+            "one lookup",
+            wants_confirmation(params),
+            summary,
+            "web.search",
+            None,
+            AllowPolicy::Once,
+            trace,
+            now_unix,
+        )?;
+
+        // One consent, both indexes, in parallel: the person asked a question.
+        // A configured provider key is a real web index; without one this is the
+        // free news-and-encyclopedia path.
+        let config = crate::web::load_config(self.paths.state_dir());
+        let (hits, missing) = self.actor.search(config.provider, &config.key, &query)?;
+        {
+            // Host and picture only: this is shown, not logged.
+            let media: Vec<(String, String)> = hits
+                .iter()
+                .filter(|hit| !hit.image.is_empty())
+                .filter_map(|hit| {
+                    let host = hit
+                        .url
+                        .split_once("://")
+                        .and_then(|(_, rest)| rest.split('/').next())
+                        .unwrap_or("")
+                        .to_string();
+                    (!host.is_empty()).then(|| (host, hit.image.clone()))
+                })
+                .take(4)
+                .collect();
+            if let Ok(mut slot) = self.last_media.lock() {
+                *slot = (!media.is_empty()).then(|| LastSearch {
+                    at: now.unix_timestamp(),
+                    media,
+                });
+            }
+        }
+        let empty = hits.is_empty();
+        self.charge(&grant, caps::WEB_SEARCH.name, now_unix)?;
+        Ok(json!({
+            "method": "web.search",
+            "query": query,
+            "missing": missing,
+            "provider": config.provider.name(),
+            "results": hits
+                .into_iter()
+                .map(|hit| json!({
+                    "title": hit.title,
+                    "url": hit.url,
+                    "when": hit.when,
+                    "source": hit.source,
+                    "snippet": hit.snippet,
+                    "image": hit.image,
+                }))
+                .collect::<Vec<_>>(),
+            "hint": if empty {
+                "nothing in the index for that query; try fewer or different words, and read a \
+                 page with web_fetch if you know the address"
+            } else {
+                ""
+            },
+        }))
+    }
+
+    /// `web.last`: the pictures the last search came with. Local, read-only, no
+    /// capability: it is the card showing what the answer is based on.
+    fn web_last(&self) -> Result<Value, ApiError> {
+        let slot = self
+            .last_media
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let Some(last) = slot.as_ref() else {
+            return Ok(json!({ "at": 0, "images": [] }));
+        };
+        let (at, images) = (last.at, &last.media);
+        Ok(json!({
+            "at": at,
+            "images": images
+                .iter()
+                .map(|(host, url)| json!({ "host": host, "url": url }))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// `web.fetch`: read one public page as text. Capability `web.search`.
+    fn web_fetch(
+        &self,
+        params: &Map<String, Value>,
+        now: OffsetDateTime,
+    ) -> Result<Value, ApiError> {
+        self.audited("web.fetch", now, |trace| {
+            trace.capability = Some(caps::WEB_SEARCH.name.to_string());
+            self.run_web_fetch(params, now, trace)
+        })
+    }
+
+    fn run_web_fetch(
+        &self,
+        params: &Map<String, Value>,
+        now: OffsetDateTime,
+        trace: &mut Trace,
+    ) -> Result<Value, ApiError> {
+        let url = required_text(params, "web.fetch", "url")?;
+        let url = crate::web::validate_url(url)?;
+        // Host only: a path or a query string can name a person or carry a token.
+        let host = url
+            .split_once("://")
+            .map(|(_, rest)| rest.split('/').next().unwrap_or_default())
+            .unwrap_or_default()
+            .to_string();
+        trace.action = Some(host.clone());
+        trace.chars = Some(url.chars().count() as u64);
+
+        let summary = format!("Read this page: {host}");
+        let now_unix = now.unix_timestamp();
+        let grant = self.require_grant_interactive(
+            &caps::WEB_SEARCH,
+            "one page",
+            wants_confirmation(params),
+            summary,
+            "web.fetch",
+            None,
+            AllowPolicy::Once,
+            trace,
+            now_unix,
+        )?;
+
+        let text = self.actor.fetch_url(&url)?;
+        self.charge(&grant, caps::WEB_SEARCH.name, now_unix)?;
+        Ok(json!({ "method": "web.fetch", "url": url, "host": host, "text": text }))
+    }
+
     /// `shell.run`: run one of the fixed desktop actions. Capability `shell.run`.
     fn shell_run(
         &self,
@@ -1216,6 +1404,77 @@ impl Broker {
     /// A live grant, or — when the caller is the card — a confirmation the person
     /// answers. The policy decides what a yes mints: one call for text, clipboard,
     /// launches and captures; a short, window-bound key approval for navigation.
+    #[allow(clippy::too_many_arguments)]
+    /// Is this machine trusted, so that nothing asks?
+    ///
+    /// A file in the state directory, not a capability: it is a property of the
+    /// machine, it is written by the person who owns it, and it is read on every
+    /// call so revoking it takes effect immediately. The audit log still records
+    /// every call, and says it was trusted — a paper trail, not a prompt.
+    fn trusted(&self) -> bool {
+        let path = self.paths.state_dir().join("trust.json");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        serde_json::from_str::<Value>(&raw)
+            .ok()
+            .and_then(|value| value.get("allowAll").and_then(Value::as_bool))
+            .unwrap_or(false)
+    }
+
+    /// Keep a standing grant for every capability while the machine is trusted.
+    ///
+    /// Trust is expressed as ordinary grants so that everything downstream — the
+    /// card, the ledger, the expiry, `consent revoke` — keeps working unchanged.
+    fn ensure_trust(&self, now_unix: i64) -> Result<(), ApiError> {
+        if !self.trusted() {
+            // Trust off must mean off: the grants it minted are standing for a
+            // day, and leaving them behind would make the switch a decoration.
+            return self.revoke_trust_grants(now_unix);
+        }
+        let mut ledger = self.ledger();
+        let mut next = ledger.clone();
+        let mut changed = false;
+        for capability in caps::CAPABILITIES {
+            let wanted = next
+                .live_for(capability.name, None, now_unix)
+                .is_none_or(|grant| grant.expires_unix - now_unix < 3600);
+            if !wanted {
+                continue;
+            }
+            next.grant_scoped(
+                capability.name,
+                GrantMode::Standing,
+                crate::grants::MAX_TTL_SECONDS,
+                // The scope is what tells these apart from a grant the person
+                // made by hand, so turning trust off can take back exactly what
+                // it gave.
+                Some(TRUST_SCOPE),
+                None,
+                now_unix,
+            )?;
+            changed = true;
+        }
+        if changed {
+            next.save(&self.paths.grants_file())?;
+            *ledger = next;
+        }
+        Ok(())
+    }
+
+    /// Take back every grant trust minted, and nothing else.
+    fn revoke_trust_grants(&self, now_unix: i64) -> Result<(), ApiError> {
+        let mut ledger = self.ledger();
+        if !ledger.has_scope(TRUST_SCOPE) {
+            return Ok(());
+        }
+        let mut next = ledger.clone();
+        next.revoke_scoped(TRUST_SCOPE, now_unix);
+        next.save(&self.paths.grants_file())?;
+        *ledger = next;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn require_grant_interactive(
         &self,
@@ -1736,6 +1995,36 @@ mod tests {
     }
 
     #[test]
+    fn trust_off_takes_back_what_trust_gave() {
+        let paths = temp_paths("trust");
+        let broker = broker(paths.clone());
+        std::fs::write(paths.state_dir().join("trust.json"), r#"{"allowAll":true}"#).unwrap();
+
+        // Trusted: every capability is granted, and it says so.
+        let caps = call(&broker, "capabilities", Value::Null).unwrap();
+        assert_eq!(caps["trusted"], Value::Bool(true));
+        let granted = caps["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|cap| !cap["grant"].is_null())
+            .count();
+        assert_eq!(granted, caps::CAPABILITIES.len());
+
+        // Not trusted: nothing is left behind, not even for a minute.
+        std::fs::remove_file(paths.state_dir().join("trust.json")).unwrap();
+        let caps = call(&broker, "capabilities", Value::Null).unwrap();
+        assert_eq!(caps["trusted"], Value::Bool(false));
+        let granted = caps["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|cap| !cap["grant"].is_null())
+            .count();
+        assert_eq!(granted, 0, "trust off left grants behind");
+    }
+
+    #[test]
     fn ping_capabilities_and_unknown_methods() {
         let paths = temp_paths("ping");
         let broker = broker(paths.clone());
@@ -1752,7 +2041,7 @@ mod tests {
 
         let caps = call(&broker, "capabilities", Value::Null).unwrap();
         let list = caps["capabilities"].as_array().unwrap();
-        assert_eq!(list.len(), 8);
+        assert_eq!(list.len(), 9);
         assert_eq!(list[0]["name"], Value::String("observe.screen".into()));
         assert_eq!(list[0]["grant"], Value::Null);
         assert_eq!(list[1]["name"], Value::String("act.type".into()));
@@ -1762,6 +2051,7 @@ mod tests {
         assert_eq!(list[5]["name"], Value::String("act.launch".into()));
         assert_eq!(list[6]["name"], Value::String("shell.run".into()));
         assert_eq!(list[7]["name"], Value::String("shell.exec".into()));
+        assert_eq!(list[8]["name"], Value::String("web.search".into()));
         assert!(list.iter().all(|entry| entry["grant"] == Value::Null));
 
         let err = call(&broker, "browser.open", Value::Null).unwrap_err();

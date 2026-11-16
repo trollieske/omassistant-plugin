@@ -118,6 +118,15 @@ Item {
   property string bestProvider: ""
   property string bestModelId: ""
   property string bestThinking: "low"
+  // The model that sees: used when the request is about the screen or drives a
+  // window. Falls back to the first vision-capable tier when unset.
+  property string screenProvider: ""
+  property string screenModelId: ""
+  property string screenThinking: "low"
+  // "Choose models for me": an empty tier is picked from the catalog inside the
+  // guardrails below. A tier the person set is never overridden.
+  property bool autoPicks: false
+  property var guardrailLimits: ({ maxCostPerMTok: 0, minContext: 0, providers: [] })
   property string localProvider: ""
   property string localModelId: ""
   property string localThinking: "low"
@@ -141,6 +150,7 @@ Item {
   property var discovery: ({ state: "idle", message: "" })
   property var localProbeQueue: []
   property var localProbeResults: []
+  property var localProbePending: null
   property var localProbeCurrent: null
   property var pendingLocalProviders: []
   property var pendingMergedModels: null
@@ -181,6 +191,10 @@ Item {
   readonly property bool dictating: root.dictation === "recording" || root.dictation === "transcribing"
   // The companion's minimized chip is a preference, not a transient.
   readonly property string uiFile: root.stateDir + "/ui.json"
+  readonly property string previewPath: root.stateDir + "/preview.png"
+  // What the person asked before, newest last. Up in an empty composer walks it
+  // back, the way a shell does.
+  property var questionHistory: []
   property bool companionCollapsed: false
   property bool uiLoaded: false
 
@@ -221,14 +235,21 @@ Item {
   // How many capabilities currently have a live grant (a person's manual grant,
   // or an approval): the pill must not claim "ask first" while it is not true.
   property int grantedCount: 0
+  property bool daemonTrusted: false
   property bool screenGranted: false
   property var grantEntries: []
   property string grantLabel: ""
   property int grantSecondsLeft: -1
   property double lastGrantRefresh: 0
-  // The permissions sheet: six capabilities, a timer, and a plain description
-  // of what each one can touch.
+  // The permissions sheet: one row per capability the broker has, a timer, and a
+  // plain description of what each one can touch. The list is checked against
+  // `capabilities` in scripts/check.sh so it cannot fall behind the daemon.
   property bool permissionsOpen: false
+  // The first-run card. `welcomed` is remembered in config, so it opens once and
+  // can always be reopened from settings.
+  property bool welcomeOpen: false
+  property bool welcomed: false
+  property var welcomeState: ({})
   property var permissionsState: ({})
   property bool permissionsFromLook: false
   property bool costsOpen: false
@@ -241,13 +262,20 @@ Item {
     { name: "act.keys", label: "Press keys",
       detail: "Tab, arrows, Enter and app shortcuts in the focused window." },
     { name: "act.pointer", label: "Use the pointer",
-      detail: "Click, double-click, right-click and scroll inside the focused window." },
+      detail: "Click, right-click and scroll in the focused window." },
     { name: "act.clipboard", label: "Use the clipboard",
       detail: "Read and write the clipboard." },
     { name: "act.launch", label: "Open apps",
-      detail: "Browser, terminal, editor and mail (Betterbird)." },
+      detail: "Browser, terminal, editor, mail — or any app installed here." },
     { name: "shell.run", label: "Desktop actions",
-      detail: "Screenshot, lock, volume, brightness, workspaces and layout." }
+      detail: "Lock, volume, brightness, workspaces and layout." },
+    // Every capability the broker has must be listed here: the sheet's ALLOW
+    // EVERYTHING grants exactly this list, so a missing entry means that
+    // capability keeps asking (and can expire) even after "allow everything".
+    { name: "shell.exec", label: "Run commands",
+      detail: "One command at a time in your own shell; never root." },
+    { name: "web.search", label: "Look things up",
+      detail: "Search the web and read a public page, without looking at the screen." }
   ]
   // Pi must not start before its MCP config exists, or the session would run
   // without tools; the write is async, so the start waits for it (or 1.5 s).
@@ -255,6 +283,18 @@ Item {
   // The overlay blanks itself for the few frames a capture takes, so the
   // screenshot shows the window instead of the card asking about it.
   property bool captureBlank: false
+  // A look costs a vision call and its answer is only as good as the picture the
+  // model gets. So the card shows the picture first: the window it will look at,
+  // captured locally, on screen, before anyone approves anything.
+  property bool previewReady: false
+  property string previewUrl: ""
+  property string previewCaption: ""
+  property bool previewBusy: false
+  // Pictures that came with the search behind the last answer, and when it was
+  // made. Shown under the answer, cleared by the next question.
+  property var mediaImages: []
+  property int mediaAt: 0
+  property int lastRunStart: 0
 
   property alias session: runtime
 
@@ -273,6 +313,9 @@ Item {
   function open(payloadJson) {
     var payload = root.parsePayload(payloadJson)
     root.opened = true
+    // Opening while a run is under way keeps the app's keyboard, and the watch
+    // below is what returns it.
+    actingFocusWatchdog.stop()
     root.unread = false
     // Opening during a run must not take the keyboard from the app the agent
     // is driving; the sidebar is a viewer plus STOP until the run settles.
@@ -285,9 +328,13 @@ Item {
     if (draft.length > 0) Qt.callLater(function() { panel.setDraft(draft) })
     if (prompt.length > 0) Qt.callLater(function() { root.submit(prompt) })
     else if (!root.actingFocus) Qt.callLater(function() { panel.focusComposer() })
+    // First run opens the welcome card once; whatever the payload was, it is
+    // still there when the person closes it.
+    if (!root.welcomed && root.configSettled) Qt.callLater(function() { root.openWelcome() })
   }
 
   function close() {
+    root.releaseActingFocus()
     // Closing the card with a confirmation on screen is a "no", not a way to
     // leave the agent waiting for a minute.
     if (root.brokerConfirm) root.denyBrokerConsent()
@@ -295,6 +342,7 @@ Item {
     root.permissionsOpen = false
     root.permissionsFromLook = false
     root.costsOpen = false
+    root.welcomeOpen = false
     root.opened = false
     root.publishState()
   }
@@ -322,11 +370,14 @@ Item {
       thinking: runtime.activeThinking,
       auto: root.autoRoute,
       localOnly: root.localOnly,
+      autoPicks: root.autoPicks,
+      guardrails: root.guardrailLimits,
       models: root.modelCatalog.length,
       route: root.lastRoute ? String(root.lastRoute.tier || "") : "",
       settings: root.settingsOpen,
       permissions: root.permissionsOpen,
       costs: root.costsOpen,
+      welcome: root.welcomeOpen,
       companion: root.desktopWidget ? "on" : "off",
       focusStepped: root.actingFocus,
       grantLabel: root.grantLabel,
@@ -380,6 +431,7 @@ Item {
 
   function submit(text, image) {
     var raw = String(text || "").trim()
+    root.rememberQuestion(raw)
     // `/look …` is a capability request, not a question: consent first, then
     // the same words go out with the screenshot attached.
     if (!image && (raw === "/look" || raw.indexOf("/look ") === 0)) {
@@ -467,29 +519,41 @@ Item {
   }
 
   function onDelta(text) {
-    if (root.assistantIndex < 0 || root.assistantIndex >= transcriptModel.count) return
+    // A delta that arrives after the row was cleared still belongs on screen:
+    // dropping it is how an answer ends up as "the assistant returned an empty
+    // answer" while the model had already replied.
+    if (!root.assistantRow()) {
+      transcriptModel.append({ kind: "assistant", label: "", text: "", streaming: true, failed: false })
+      root.assistantIndex = transcriptModel.count - 1
+    }
     root.pendingDelta += text
     if (!deltaFlush.running) deltaFlush.start()
+  }
+
+  function assistantRow() {
+    return root.assistantIndex >= 0 && root.assistantIndex < transcriptModel.count
   }
 
   function flushDelta() {
     if (!root.pendingDelta.length) return
     var text = root.pendingDelta
     root.pendingDelta = ""
-    if (root.assistantIndex < 0 || root.assistantIndex >= transcriptModel.count) return
+    if (!root.assistantRow()) return
     var row = transcriptModel.get(root.assistantIndex)
     transcriptModel.setProperty(root.assistantIndex, "text", String(row.text || "") + text)
   }
 
   onBusyChanged: {
     if (root.busy) {
+      root.lastRunStart = Math.floor(Date.now() / 1000)
+      root.mediaImages = []
       pendingPoll.start()
     } else {
       pendingPoll.stop()
       root.cancelBrokerDecision()
       root.brokerConfirm = false
       root.brokerGrantActive = false
-      root.actingFocus = false
+      root.releaseActingFocus()
       // Always, not only when an approval was used: revoke_run also fails any
       // confirmation still waiting in the broker, so a stopped answer cannot
       // leave a tool call blocked for a minute.
@@ -525,7 +589,14 @@ Item {
     if (detail.length > 0) {
       root.appendNote(interrupted ? "STOPPED" : (!ok ? "ERROR" : "NOTE"), detail, !ok && !interrupted)
     } else if (ok && hadRow && wrote.trim().length === 0) {
-      root.appendNote("NOTE", "The assistant returned an empty answer.", false)
+      // A small model can spend the whole turn thinking and never answer. Saying
+      // "empty answer" makes that look like a bug in the card; the second turn is
+      // usually fine, because the prompt is cached by then.
+      var localModel = runtime.activeProvider === root.localProvider
+        || String(runtime.activeProvider).indexOf("omassistant-") === 0
+      root.appendNote("NOTE", localModel
+        ? "The local model used the turn on thinking and never got to the answer. Ask again — the next one is faster, because the prompt is cached."
+        : "The assistant returned an empty answer.", false)
     }
 
     if (ok && wrote.trim().length > 0) root.lastAnswer = wrote
@@ -849,10 +920,51 @@ Item {
   // The companion is a preference with teeth: right-click or the settings row
   // saves `desktopWidget:false`, so opening the overlay or restarting the shell
   // no longer brings it back. The bar diamond is independent and stays.
+  //
+  // The card gives the keyboard back to the app an action is driving, and that
+  // is the one state where the person cannot press Escape: the layer surface has
+  // no keyboard at all. So it is never permanent. It ends when the run ends, it
+  // ends if nothing has happened for a while, and clicking the card ends it.
   function stepAside() {
-    if (root.actingFocus) return
+    if (root.actingFocus) {
+      actingFocusWatchdog.restart()
+      return
+    }
     root.actingFocus = true
     root.publishState()
+    actingFocusWatchdog.restart()
+  }
+
+  // Ask the broker what the last search came with. If the search is older than
+  // this turn, it belongs to an earlier answer and is not shown.
+  function refreshMedia() {
+    var startedAt = root.lastRunStart
+    daemon.call("web.last", {}, function(ok, result) {
+      if (!ok || !result || !result.images) return
+      var images = result.images
+      var at = Number(result.at || 0)
+      if (!images.length || at < startedAt) return
+      root.mediaImages = images
+      root.mediaAt = at
+    })
+  }
+
+  function releaseActingFocus() {
+    actingFocusWatchdog.stop()
+    if (!root.actingFocus) return
+    root.actingFocus = false
+    root.publishState()
+    if (root.opened) Qt.callLater(function() { panel.focusComposer() })
+  }
+
+  Timer {
+    id: actingFocusWatchdog
+    // Long enough that it never interrupts an action, short enough that a person
+    // is not left without a keyboard. Every action steps aside again, which
+    // restarts this.
+    interval: 20000
+    repeat: false
+    onTriggered: root.releaseActingFocus()
   }
 
   function setDesktopWidget(on) {
@@ -869,17 +981,41 @@ Item {
     root.saveUi()
   }
 
+  function rememberQuestion(text) {
+    var line = String(text || "").trim()
+    if (!line.length || line.indexOf("/") === 0) return
+    var list = root.questionHistory.slice()
+    if (list.length && list[list.length - 1] === line) return
+    // Asking the same thing again moves it to the end instead of duplicating it.
+    for (var i = list.length - 1; i >= 0; i--) if (list[i] === line) list.splice(i, 1)
+    list.push(line)
+    while (list.length > 50) list.shift()
+    root.questionHistory = list
+    root.saveUi()
+  }
+
   function loadUi(raw) {
     var data = null
     try { data = JSON.parse(String(raw || "{}")) } catch (error) { data = null }
     if (data && typeof data === "object" && typeof data.companionCollapsed === "boolean")
       root.companionCollapsed = data.companionCollapsed
+    if (data && typeof data === "object" && data.questionHistory instanceof Array) {
+      var kept = []
+      for (var i = 0; i < data.questionHistory.length; i++) {
+        var line = String(data.questionHistory[i] || "").trim()
+        if (line.length) kept.push(line)
+      }
+      root.questionHistory = kept.slice(-50)
+    }
     root.uiLoaded = true
   }
 
   function saveUi() {
     if (!root.workspaceReady) return
-    uiView.setText(JSON.stringify({ companionCollapsed: root.companionCollapsed }) + "\n")
+    uiView.setText(JSON.stringify({
+      companionCollapsed: root.companionCollapsed,
+      questionHistory: root.questionHistory
+    }) + "\n")
   }
 
   // --- the kill switches ---------------------------------------------------
@@ -1221,6 +1357,67 @@ Item {
     if (question.length) Qt.callLater(function() { panel.setDraft(question) })
   }
 
+  function requestScreenPreview() {
+    if (root.brokerCapability !== "observe.screen") return
+    if (root.previewBusy) return
+    root.previewBusy = true
+    root.previewReady = false
+    // The card must not be in the shot, so it goes transparent for the capture.
+    root.captureBlank = true
+    previewProbe.command = ["hyprctl", "-j", "activewindow"]
+    previewDelay.restart()
+  }
+
+  function onPreviewWindow(raw) {
+    var data = null
+    try { data = JSON.parse(String(raw || "{}")) } catch (error) { data = null }
+    // The consent row says what will be captured ("the whole screen" or a
+    // window); the preview has to be the same thing, or it is a misleading
+    // picture.
+    var wholeScreen = String(root.brokerSummary || "").toLowerCase().indexOf("screen") >= 0
+    var geometry = ""
+    if (!wholeScreen && data && data.size && typeof data.size[0] === "number") {
+      var x = Math.round(data.at[0])
+      var y = Math.round(data.at[1])
+      var w = Math.round(data.size[0])
+      var h = Math.round(data.size[1])
+      if (w > 0 && h > 0) geometry = x + "," + y + " " + w + "x" + h
+    }
+    if (wholeScreen) root.previewCaption = "the whole screen"
+    else if (data) root.previewCaption = String(data.class || "") + (data.title ? " — " + String(data.title) : "")
+    if (!geometry.length) {
+      previewShot.command = ["grim", root.previewPath]
+    } else {
+      previewShot.command = ["grim", "-g", geometry, root.previewPath]
+    }
+    previewShot.running = true
+  }
+
+  function onPreviewShot(exitCode) {
+    root.captureBlank = false
+    root.previewBusy = false
+    if (exitCode !== 0) {
+      root.previewReady = false
+      return
+    }
+    // A new query string each time, or QML shows the previous picture.
+    root.previewUrl = "file://" + root.previewPath + "?v=" + Date.now()
+    root.previewReady = true
+    // grim writes with the shell's umask; the picture is a screenshot of the
+    // person's screen, so it gets owner-only like every other capture.
+    previewChmod.command = ["chmod", "600", root.previewPath]
+    previewChmod.running = true
+  }
+
+  // The preview exists only while the question is on screen. A screenshot left
+  // behind is a screenshot nobody remembers taking.
+  function discardPreview() {
+    root.previewReady = false
+    root.previewUrl = ""
+    previewCleanup.command = ["rm", "-f", root.previewPath]
+    previewCleanup.running = true
+  }
+
   function allowLook() {
     if (root.lookState !== "consent") return
     root.lookState = "looking"
@@ -1362,12 +1559,25 @@ Item {
     root.bestProvider = root.cleanString(cfg.bestProvider, "", 120)
     root.bestModelId = root.cleanString(cfg.bestModel, "", 200)
     root.bestThinking = root.cleanString(cfg.bestThinking, root.thinkingLevel, 20)
+    root.screenProvider = root.cleanString(cfg.screenProvider, "", 120)
+    root.screenModelId = root.cleanString(cfg.screenModel, "", 200)
+    root.screenThinking = root.cleanString(cfg.screenThinking, root.bestThinking, 20)
+    root.autoPicks = cfg.autoPicks === true
+    root.guardrailLimits = {
+      maxCostPerMTok: Math.max(0, Math.min(1000, Number((cfg.guardrails || {}).maxCostPerMTok) || 0)),
+      minContext: Math.max(0, Math.min(4000000, Number((cfg.guardrails || {}).minContext) || 0)),
+      providers: Array.isArray((cfg.guardrails || {}).providers)
+        ? (cfg.guardrails.providers || []).map(function(name) { return root.cleanString(name, "", 60) })
+          .filter(function(name) { return name.length > 0 }).slice(0, 20)
+        : []
+    }
     root.localProvider = root.cleanString(cfg.localProvider, "", 120)
     root.localModelId = root.cleanString(cfg.localModel, "", 200)
     root.localThinking = root.cleanString(cfg.localThinking, "low", 20)
     root.prewarm = cfg.prewarm === false ? false : true
     root.memory = cfg.memory === false ? false : true
     root.desktopWidget = cfg.desktopWidget === true
+    root.welcomed = cfg.welcomed === true
     root.lookEnabled = cfg.look === false ? false : true
     root.configuredCtl = root.cleanString(cfg.daemonCtl, "", 500)
     root.configuredDaemon = root.cleanString(cfg.daemonBin, "", 500)
@@ -1452,11 +1662,39 @@ Item {
     return args.concat(root.extraArgs)
   }
 
+  // Which model pi starts on. With automatic choice on, that is the Fast tier —
+  // the model short questions use — rather than an invisible third model nobody
+  // picked (pi's own last choice, which then showed as "answering with" until the
+  // first question switched away from it).
+  function startModel() {
+    var candidate = null
+    if (root.autoRoute && root.fastModelId.length) {
+      candidate = { provider: root.fastProvider, id: root.fastModelId,
+        thinking: root.fastThinking }
+    }
+    if (!candidate && root.modelId.length) {
+      candidate = { provider: root.provider, id: root.modelId,
+        thinking: root.thinkingLevel }
+    }
+    if (!candidate) return null
+    // The catalog arrives *from* pi, so on a cold start there is nothing to check
+    // against yet and the configured name is the best knowledge we have. Once the
+    // list is here, a model pi no longer has must not be passed (it would stop the
+    // child from starting at all).
+    if (root.modelCatalog.length > 0 && !root.findModel(candidate.provider, candidate.id)) {
+      return null
+    }
+    return candidate
+  }
+
   function runtimeArgv() {
     var args = root.baseArgv()
-    if (root.modelId.length) {
-      if (root.provider.length) args.push("--provider", root.provider)
-      args.push("--model", root.modelId)
+    var start = root.startModel()
+    if (start) {
+      if (start.provider.length) args.push("--provider", start.provider)
+      args.push("--model", start.id)
+      if (start.thinking.length) args.push("--thinking", start.thinking)
+      return args
     }
     if (root.thinkingLevel.length) args.push("--thinking", root.thinkingLevel)
     return args
@@ -1478,7 +1716,11 @@ Item {
     // A list delivered through a QML signal is a QVariantList, not a JS array
     // (the same gotcha as get_messages); duck-type it.
     if (!raw || typeof raw.length !== "number") return out
-    for (var i = 0; i < raw.length && out.length < 200; i++) {
+    // The cap is a guard against a hostile list, not a budget. 200 was low
+    // enough that a large catalog filled it before the person's own local
+    // providers (they come last) were reached, and the local model simply did
+    // not exist as far as the card was concerned.
+    for (var i = 0; i < raw.length && out.length < 1000; i++) {
       var m = raw[i]
       if (!m || typeof m !== "object") continue
       var provider = root.cleanString(m.provider, "", 120)
@@ -1516,12 +1758,28 @@ Item {
     return out
   }
 
+  // One sentence for the settings row: the limits the automatic choice obeys.
+  function guardrailSummary() {
+    var parts = []
+    if (root.localOnly) parts.push("local only")
+    if (root.guardrailLimits.maxCostPerMTok > 0)
+      parts.push("$" + root.guardrailLimits.maxCostPerMTok + "/M tokens")
+    if (root.guardrailLimits.minContext > 0)
+      parts.push(Math.round(root.guardrailLimits.minContext / 1000) + "k context")
+    if (root.guardrailLimits.providers.length)
+      parts.push(root.guardrailLimits.providers.join(", "))
+    return parts.join(" · ")
+  }
+
   function routingConfig() {
     return {
+      autoPicks: root.autoPicks,
+      guardrails: root.guardrailLimits,
       default: { provider: root.provider, id: root.modelId, thinking: root.thinkingLevel },
       fast: { provider: root.fastProvider, id: root.fastModelId, thinking: root.fastThinking },
       best: { provider: root.bestProvider, id: root.bestModelId, thinking: root.bestThinking },
-      local: { provider: root.localProvider, id: root.localModelId, thinking: root.localThinking }
+      local: { provider: root.localProvider, id: root.localModelId, thinking: root.localThinking },
+      screen: { provider: root.screenProvider, id: root.screenModelId, thinking: root.screenThinking }
     }
   }
 
@@ -1683,6 +1941,10 @@ Item {
   }
 
   function stopRun(note) {
+    // First, before anything that can fail: STOP is the documented way out of
+    // everything, including a run that took the keyboard. Handing it back is the
+    // first thing stopping does.
+    root.releaseActingFocus()
     var canceled = root.cancelRoute(true)
     if (runtime.busy) runtime.abort()
     root.brokerGrantActive = false
@@ -1717,12 +1979,23 @@ Item {
 
   // --- the settings page --------------------------------------------------
 
+  // pi names a model "Provider: Model", and several providers repeat their own
+  // name there ("DeepSeek: DeepSeek V4.1 Flash 1017"). The card shows the model,
+  // so a prefix that is already the first word of the name is dropped.
+  function shortModelName(name) {
+    var text = String(name || "")
+    var match = /^([^:]{1,24}):\s*(.+)$/.exec(text)
+    if (!match) return text
+    var rest = match[2]
+    return rest.toLowerCase().indexOf(match[1].toLowerCase()) === 0 ? rest : text
+  }
+
   function modelInfo(model, thinking) {
     if (!model) return null
     return {
       provider: model.provider,
       id: model.id,
-      name: model.name || model.id,
+      name: root.shortModelName(model.name || model.id),
       key: Routing.modelKey(model),
       providerLabel: Routing.providerLabel(model.provider),
       tags: Routing.tags(model),
@@ -1749,12 +2022,26 @@ Item {
       current: {
         provider: runtime.activeProvider,
         id: runtime.activeModelId,
-        name: runtime.activeModelName || runtime.modelLabel,
+        name: root.shortModelName(runtime.activeModelName || runtime.modelLabel),
         thinking: runtime.activeThinking
       },
       default: root.modelInfo(resolved.default, resolved.defaultThinking),
       fast: root.modelInfo(resolved.fast, resolved.fastThinking),
       best: root.modelInfo(resolved.best, resolved.bestThinking),
+      screen: root.modelInfo(resolved.screen, resolved.screenThinking),
+      screenWarning: Routing.modelWarning(resolved.screen),
+      autoPicks: root.autoPicks,
+      guardrailSummary: root.guardrailSummary(),
+      fastWarning: Routing.modelWarning(resolved.fast),
+      bestWarning: Routing.modelWarning(resolved.best),
+      screenModel: root.modelInfo(Routing.modelForScreenWork({
+        catalog: root.modelCatalog,
+        current: { provider: runtime.activeProvider, id: runtime.activeModelId },
+        default: { provider: root.provider, id: root.modelId, thinking: root.thinkingLevel },
+        fast: { provider: root.fastProvider, id: root.fastModelId, thinking: root.fastThinking },
+        best: { provider: root.bestProvider, id: root.bestModelId, thinking: root.bestThinking },
+        local: { provider: root.localProvider, id: root.localModelId, thinking: root.localThinking }
+      }), ""),
       local: root.modelInfo(resolved.local, resolved.localThinking),
       auto: root.autoRoute,
       autoAvailable: root.modelCatalog.length >= 2,
@@ -1823,10 +2110,20 @@ Item {
   function chooseModelFor(role, provider, id) {
     if (!root.findModel(provider, id)) return
     var patch = {}
+    if (role === "screen") {
+      patch.screenProvider = provider
+      patch.screenModel = id
+      var screenModel = root.findModel(provider, id)
+      if (screenModel && !Routing.hasVision(screenModel)) {
+        root.appendNote("MODEL", "That model cannot look at screens; the screen tier will fall back to a vision model.", false)
+      }
+    }
     if (role === "default") {
       patch.provider = String(provider)
       patch.model = String(id)
       if (!root.thinkingLevel.length) patch.thinking = "low"
+    } else if (role === "screen") {
+      // Handled above: the screen tier also warns when the model cannot look.
     } else if (role === "fast" || role === "best" || role === "local") {
       patch[role + "Provider"] = String(provider)
       patch[role + "Model"] = String(id)
@@ -1835,6 +2132,14 @@ Item {
       if (role === "local" && !root.localThinking.length) patch.localThinking = "low"
     }
     root.saveConfigPatch(patch)
+  }
+
+  function setAutoPicks(on) {
+    var value = on === true
+    if (root.autoPicks === value) return
+    root.autoPicks = value
+    root.saveConfigPatch({ autoPicks: value })
+    root.refreshModelCatalog()
   }
 
   function setAutoChoice(on) {
@@ -1895,7 +2200,10 @@ Item {
         baseUrl: "http://127.0.0.1:11434/v1", apiKey: "ollama" },
       { key: "lmstudio", name: "LM Studio", url: "http://127.0.0.1:1234/v1/models",
         baseUrl: "http://127.0.0.1:1234/v1", apiKey: "lmstudio" },
+      // /props is llama.cpp's own route, not an OpenAI one: only this candidate
+      // asks for it, and a missing answer just leaves the field out.
       { key: "llamacpp", name: "llama.cpp", url: "http://127.0.0.1:8080/v1/models",
+        propsUrl: "http://127.0.0.1:8080/props",
         baseUrl: "http://127.0.0.1:8080/v1", apiKey: "local" }
     ]
     root.discovery = { state: "searching", message: "Looking for Ollama, LM Studio and llama.cpp…" }
@@ -1935,17 +2243,58 @@ Item {
     return ids
   }
 
+  // The server's own window, in tokens. Pi's default is 128000 and that would be
+  // a lie about a 16K server: the agent then never compacts and llama.cpp
+  // truncates silently, which reads as "the model is stupid".
+  function contextFromProps(raw) {
+    var text = String(raw || "")
+    if (text.length > 100000) return 0
+    var data = null
+    try { data = JSON.parse(text) } catch (error) { data = null }
+    if (!data || typeof data !== "object") return 0
+    var generation = data.default_generation_settings
+    var value = generation && typeof generation === "object" ? generation.n_ctx : null
+    if (typeof value !== "number" && typeof data.n_ctx === "number") value = data.n_ctx
+    if (typeof value !== "number") return 0
+    value = Math.floor(value)
+    // A window bigger than 4M tokens is not a real answer; treat it as unknown.
+    if (value < 256 || value > 4000000) return 0
+    return value
+  }
+
   function onLocalProbeDone(exitCode) {
     var probe = root.localProbeCurrent
     root.localProbeCurrent = null
-    if (probe && exitCode === 0) {
-      var ids = root.localIdsFrom(localProbeOut.text)
-      if (ids.length) {
-        root.localProbeResults.push({
-          key: probe.key, name: probe.name, baseUrl: probe.baseUrl,
-          apiKey: probe.apiKey, models: ids
-        })
-      }
+    if (!probe) {
+      root.runNextLocalProbe()
+      return
+    }
+    var ids = exitCode === 0 ? root.localIdsFrom(localProbeOut.text) : []
+    if (!ids.length) {
+      root.runNextLocalProbe()
+      return
+    }
+    var entry = {
+      key: probe.key, name: probe.name, baseUrl: probe.baseUrl,
+      apiKey: probe.apiKey, models: ids
+    }
+    if (String(probe.propsUrl || "").length) {
+      root.localProbePending = entry
+      localPropsProbe.command = ["curl", "-fsS", "--max-time", "2", String(probe.propsUrl)]
+      localPropsProbe.running = true
+      return
+    }
+    root.localProbeResults.push(entry)
+    root.runNextLocalProbe()
+  }
+
+  function onLocalPropsDone(exitCode) {
+    var entry = root.localProbePending
+    root.localProbePending = null
+    if (entry) {
+      var context = exitCode === 0 ? root.contextFromProps(localPropsOut.text) : 0
+      if (context > 0) entry.contextWindow = context
+      root.localProbeResults.push(entry)
     }
     root.runNextLocalProbe()
   }
@@ -1975,6 +2324,105 @@ Item {
     piModelsView.reload()
   }
 
+  // A hybrid thinking model needs pi to know how to turn thinking off, or
+  // `--thinking off` is a silent no-op and every trivial answer costs five times
+  // the tokens. Only models we actually know are listed here; guessing would make
+  // things worse for everyone else.
+  function thinkingFormatFor(id) {
+    var name = String(id || "").toLowerCase()
+    if (name.indexOf("qwen3") === 0 || name.indexOf("qwen3.") === 0
+        || name.indexOf("qwen3-") === 0 || name.indexOf("qwen3_") === 0) return "qwen-chat-template"
+    return ""
+  }
+
+  // One entry as pi will read it. Everything here is deliberate: pi's defaults
+  // are 128000/16384, which describe a server that does not exist.
+  function localModelEntry(id, result) {
+    var entry = { id: String(id), name: String(id) }
+    var context = result && typeof result.contextWindow === "number" ? Math.floor(result.contextWindow) : 0
+    if (context > 0) {
+      entry.contextWindow = context
+      // Half the window leaves room for the answer inside the same context.
+      entry.maxTokens = Math.max(512, Math.floor(context / 2))
+    }
+    var format = root.thinkingFormatFor(id)
+    if (format.length) {
+      entry.reasoning = true
+      entry.compat = { thinkingFormat: format }
+    }
+    return entry
+  }
+
+  // Compare endpoints the way a person would: trailing slash and the /v1 suffix
+  // are noise, and case never matters in a host.
+  function normalizedBaseUrl(value) {
+    var url = String(value || "").trim().toLowerCase()
+    while (url.length && url.charAt(url.length - 1) === "/") url = url.slice(0, -1)
+    if (url.slice(-3) === "/v1") url = url.slice(0, -3)
+    return url
+  }
+
+  // The provider the person already has for this endpoint, if any. Ours do not
+  // count: those are the ones we are here to write.
+  function providerCovering(doc, baseUrl, ids) {
+    var wanted = root.normalizedBaseUrl(baseUrl)
+    if (!wanted.length) return ""
+    var names = Object.keys(doc.providers || {})
+    for (var i = 0; i < names.length; i++) {
+      var name = names[i]
+      if (String(name).indexOf("omassistant-") === 0) continue
+      var provider = doc.providers[name]
+      if (!provider || typeof provider !== "object") continue
+      if (root.normalizedBaseUrl(provider.baseUrl) !== wanted) continue
+      var listed = provider.models
+      if (!Array.isArray(listed)) continue
+      for (var k = 0; k < listed.length; k++) {
+        var item = listed[k]
+        var id = item && typeof item === "object" ? item.id : item
+        for (var m = 0; m < ids.length; m++) {
+          if (String(id) === String(ids[m])) return String(name)
+        }
+      }
+    }
+    return ""
+  }
+
+  // pi validates models.json all-or-nothing: one bad value and *every* provider
+  // disappears, including the cloud models the person pays for. So what we write
+  // is checked here, and the file is left alone if anything is off.
+  function isPositiveInt(value) {
+    return typeof value === "number" && isFinite(value) && Math.floor(value) === value && value > 0
+  }
+
+  function localEntryError(name, provider) {
+    if (!provider || typeof provider !== "object") return name + ": not an object"
+    if (typeof provider.baseUrl !== "string" || !provider.baseUrl.length)
+      return name + ": baseUrl must be a string"
+    if (typeof provider.api !== "string" || !provider.api.length) return name + ": api must be a string"
+    if (typeof provider.apiKey !== "string") return name + ": apiKey must be a string"
+    if (!Array.isArray(provider.models) || !provider.models.length)
+      return name + ": models must be a non-empty array"
+    for (var i = 0; i < provider.models.length; i++) {
+      var model = provider.models[i]
+      if (!model || typeof model !== "object") return name + ": model " + i + " is not an object"
+      if (typeof model.id !== "string" || !model.id.length) return name + ": model " + i + " needs a string id"
+      if (typeof model.name !== "string") return name + ": model " + i + " needs a string name"
+      if (model.contextWindow !== undefined && !root.isPositiveInt(model.contextWindow))
+        return name + ": contextWindow must be a positive integer"
+      if (model.maxTokens !== undefined && !root.isPositiveInt(model.maxTokens))
+        return name + ": maxTokens must be a positive integer"
+      if (model.reasoning !== undefined && typeof model.reasoning !== "boolean")
+        return name + ": reasoning must be a boolean"
+      if (model.compat !== undefined) {
+        if (!model.compat || typeof model.compat !== "object") return name + ": compat must be an object"
+        var format = model.compat.thinkingFormat
+        if (format !== undefined && format !== "qwen-chat-template" && format !== "chat-template")
+          return name + ": unknown thinkingFormat"
+      }
+    }
+    return ""
+  }
+
   function mergePiModels(raw) {
     if (!root.awaitingModelsRead) return
     root.awaitingModelsRead = false
@@ -1989,19 +2437,70 @@ Item {
     }
     if (!doc) doc = {}
     if (!doc.providers || typeof doc.providers !== "object" || Array.isArray(doc.providers)) doc.providers = {}
+
+    var written = []
+    var covered = []
     for (var i = 0; i < root.pendingLocalProviders.length; i++) {
       var result = root.pendingLocalProviders[i]
+      var name = "omassistant-" + result.key
+      var owner = root.providerCovering(doc, result.baseUrl, result.models)
       var models = []
       for (var k = 0; k < result.models.length; k++) {
-        models.push({ id: result.models[k], name: result.models[k] })
+        models.push(root.localModelEntry(result.models[k], result))
       }
-      doc.providers["omassistant-" + result.key] = {
+      if (owner.length) {
+        // Someone else already serves this endpoint with these models. Adding a
+        // second provider for it would be two answers to the same question, one
+        // of them wrong — so only our own previous entry is refreshed, and the
+        // person's provider is never touched.
+        if (doc.providers[name] !== undefined) {
+          doc.providers[name] = {
+            baseUrl: result.baseUrl,
+            api: "openai-completions",
+            apiKey: result.apiKey,
+            models: models
+          }
+          written.push(name)
+          covered.push(result.name + " — already covered by " + owner + ", our own entry refreshed")
+        } else {
+          covered.push(result.name + " — already covered by " + owner)
+        }
+        continue
+      }
+      doc.providers[name] = {
         baseUrl: result.baseUrl,
         api: "openai-completions",
         apiKey: result.apiKey,
         models: models
       }
+      written.push(name)
     }
+
+    for (var w = 0; w < written.length; w++) {
+      var error = root.localEntryError(written[w], doc.providers[written[w]])
+      if (error.length) {
+        root.localDiscoveryFailed(
+          "The generated model list was not valid, so models.json was left untouched (" + error + ").")
+        return
+      }
+    }
+
+    if (!written.length) {
+      // Nothing to write is a result, not a failure: do not touch the file, and
+      // do not restart pi for a change that is not there.
+      root.pendingMergedModels = null
+      root.pendingLocalProviders = []
+      root.discovery = {
+        state: "added",
+        message: covered.length ? covered.join("; ") : "Nothing new to add."
+      }
+      root.refreshSettings()
+      return
+    }
+
+    root.localAddedSummary = covered.length
+      ? ("Added " + written.length + " — " + covered.join("; "))
+      : ("Added " + written.length + " provider" + (written.length === 1 ? "" : "s"))
     root.pendingMergedModels = doc
     piModelsWrite.setText(JSON.stringify(doc, null, 2) + "\n")
   }
@@ -2154,6 +2653,8 @@ Item {
       }
       root.grantEntries = entries
       root.grantedCount = count
+      // The machine is trusted: every capability is granted, and nothing asks.
+      root.daemonTrusted = result.trusted === true
       root.screenGranted = screen
       root.updateGrantLabel()
       root.refreshPermissionsState()
@@ -2235,6 +2736,81 @@ Item {
     }
   }
 
+  // What the welcome card says is true right now: the runtime, the model the
+  // routing picked, the broker, and how much is granted.
+  function welcomeSnapshot() {
+    return {
+      piReady: runtime.live || (runtime.running && runtime.faultText.length === 0),
+      model: root.shortModelName(runtime.activeModelName || runtime.modelLabel),
+      broker: daemon.connected,
+      granted: root.grantedCount,
+      version: root.manifest && root.manifest.version ? String(root.manifest.version) : "",
+      ideas: [
+        { prompt: "What is this window showing, and what does the error mean?" },
+        { prompt: "Open the file manager and make three folders in Documents" },
+        { prompt: "Sort my Downloads into folders by file type" },
+        { prompt: "What have I spent on this assistant, and on which model?" }
+      ]
+    }
+  }
+
+  function refreshWelcomeState() {
+    if (!root.welcomeOpen) return
+    root.welcomeState = root.welcomeSnapshot()
+  }
+
+  // Before the agent is handed a screenshot, the model that will look at it has to
+  // be able to. Asking the question is not enough: an ordinary request ("is this
+  // mail spam?") can end in a capture, and a text-only model would describe what it
+  // imagines. Returns the model it switched to, or "" when nothing changed.
+  function ensureScreenModel() {
+    var live = root.findModel(runtime.activeProvider, runtime.activeModelId)
+    if (live && Routing.hasVision(live)) return ""
+    var resolved = root.resolvedTiers()
+    if (!resolved.screen) return ""
+    if (live && String(live.id) === String(resolved.screen.id)
+        && String(live.provider) === String(resolved.screen.provider)) return ""
+    var name = resolved.screen.name || resolved.screen.id
+    runtime.setModel(resolved.screen.provider, resolved.screen.id,
+      resolved.screenThinking, function(ok) {
+        if (ok) {
+          root.lastRoute = { tier: "screen", provider: resolved.screen.provider,
+            id: resolved.screen.id, name: name, reason: "it has to see the screen" }
+          root.lastRouteTier = "screen"
+          root.appendNote("MODEL", "Switched to " + root.shortModelName(name)
+            + " so it can see the screen.", false)
+        }
+      })
+    return String(name)
+  }
+
+  function openWelcome() {
+    if (root.settingsOpen) root.settingsOpen = false
+    if (root.permissionsOpen) root.permissionsOpen = false
+    if (root.costsOpen) root.closeCosts()
+    root.open("{}")
+    root.welcomeOpen = true
+    root.ensureDaemon()
+    root.welcomeState = root.welcomeSnapshot()
+    if (!root.welcomed) {
+      root.welcomed = true
+      root.saveConfigPatch({ welcomed: true })
+    }
+  }
+
+  function closeWelcome() {
+    root.welcomeOpen = false
+    root.publishState()
+  }
+
+  // Picking an idea is a real question: it goes into the composer and is sent,
+  // with the same consent path as anything typed by hand.
+  function askFromWelcome(prompt) {
+    var text = String(prompt || "").trim()
+    root.closeWelcome()
+    if (text.length) root.submit(text)
+  }
+
   function openPermissions() {
     if (root.brokerConfirm || root.actionState !== "" || root.lookState === "looking") {
       root.appendNote("PERMISSIONS", "Answer the card first; permissions can wait.", false)
@@ -2283,13 +2859,16 @@ Item {
     var provider = cut >= 0 ? text.slice(0, cut) : ""
     var id = cut >= 0 ? text.slice(cut + 1) : text
     var known = root.findModel(provider, id)
-    if (known) return known.name
+    // Same rule as the settings rows: "DeepSeek: DeepSeek V4.1" is one name twice.
+    if (known) return root.shortModelName(known.name)
     return Routing.providerLabel(provider) + (id.length ? " · " + id.split("/").pop() : "")
   }
 
   function costSessionTitle(file, entry, fallback) {
     if (entry && String(entry.title || "").length) return String(entry.title)
-    if (fallback && String(fallback).length) return root.formatWhen(String(fallback))
+    // No title to show: say so, rather than printing the date twice (once as the
+    // title, once in the row's meta line).
+    if (fallback && String(fallback).length) return "(untitled)"
     var name = String(file || "")
     var cut = name.indexOf("T")
     return cut > 0 ? name.slice(0, cut) : name
@@ -2518,6 +3097,7 @@ Item {
     root.brokerPendingId = ""
     root.brokerSummary = ""
     root.brokerCapability = ""
+    root.discardPreview()
   }
 
   function publishState() {
@@ -2558,11 +3138,18 @@ Item {
     function history(): string { return root.historyJson() }
     function companion(): void { root.setDesktopWidget(!root.desktopWidget) }
     function stepAside(): void { root.stepAside() }
+    // A string, because the IPC hands over what was typed: "off", "false", "on".
+    function trust(mode: string): void {
+      var value = String(mode || "").toLowerCase()
+      root.setTrusted(value === "on" || value === "true" || value === "1")
+    }
     function costs(): void { root.openCosts() }
     function companionCollapse(): void { root.setCompanionCollapsed(!root.companionCollapsed) }
     function dictate(): void { root.toggleDictation() }
     function settings(): void { root.openSettings() }
     function permissions(): void { root.openPermissions() }
+    function welcome(): void { root.openWelcome() }
+    function ensureScreen(): string { return root.ensureScreenModel() }
   }
 
   ListModel { id: transcriptModel }
@@ -2731,7 +3318,10 @@ Item {
     interval: 20000
     repeat: true
     running: root.opened
-    onTriggered: root.refreshGrants()
+    onTriggered: {
+      root.refreshGrants()
+      root.refreshWelcomeState()
+    }
   }
 
   Timer {
@@ -2830,6 +3420,13 @@ Item {
     socketPath: root.daemonSocketPath
   }
 
+  // The welcome card claims the broker is connected, so it has to notice the
+  // moment it is: the socket connects a beat after the card opens.
+  Connections {
+    target: daemon
+    function onConnectionChanged() { root.refreshWelcomeState() }
+  }
+
   Process {
     id: omarchyDictation
     onExited: function(exitCode) {
@@ -2889,6 +3486,36 @@ Item {
       }
     }
   }
+
+  Timer {
+    id: previewDelay
+    // The card fades out before it paints transparent; 140 ms still caught it in
+    // the shot, which made "what it will see" show the card itself.
+    interval: 300
+    repeat: false
+    onTriggered: previewProbe.running = true
+  }
+
+  Process {
+    id: previewProbe
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onPreviewWindow(text)
+    }
+    onExited: function(exitCode) {
+      // No compositor answer (or a windowless screen): still show the screen.
+      if (exitCode !== 0) root.onPreviewWindow("")
+    }
+  }
+
+  Process {
+    id: previewShot
+    onExited: function(exitCode) { root.onPreviewShot(exitCode) }
+  }
+
+  Process { id: previewChmod }
+
+  Process { id: previewCleanup }
 
   Process {
     id: lookCapProc
@@ -3066,6 +3693,15 @@ Item {
   }
 
   Process {
+    id: localPropsProbe
+    stdout: StdioCollector {
+      id: localPropsOut
+      waitForEnd: true
+    }
+    onExited: function(exitCode) { root.onLocalPropsDone(exitCode) }
+  }
+
+  Process {
     id: piModelsMkdir
     onExited: function(exitCode) {
       if (exitCode === 0) root.readPiModels()
@@ -3117,6 +3753,97 @@ Item {
     onExited: function(exitCode) { root.restartAfterLocalAdd() }
   }
 
+  // --- web search provider -----------------------------------------------
+  // The key never goes on a command line: it is written to the helper's stdin,
+  // and the helper stores it 0600 in the state directory.
+  property string webProvider: "keyless"
+  property bool webKeySet: false
+  property string pendingProvider: ""
+  // The key waits here for the process to start; writing before `running` is a
+  // write into nothing.
+  property string pendingKey: ""
+  // A Process reads `command` from this property: assigning to a Process's
+  // command at runtime and starting it in the same turn can start the old one.
+  property var webConfigCommand: []
+
+  function refreshWebSearch() { webStatusProc.running = true }
+
+  // Trust is a file the broker reads on every call, so flipping it takes effect
+  // at once. The card shows it either way; this is only the switch.
+  function setTrusted(on) {
+    trustProc.command = [root.lookCtl, "trust", on ? "on" : "off"]
+    trustProc.running = true
+  }
+
+  function onTrustSaved(exitCode) {
+    if (exitCode !== 0) {
+      root.appendNote("TRUST", "Could not change the trust setting (" + root.lookCtl + ").", true)
+    }
+    root.refreshGrants()
+  }
+
+  function onWebStatus(text) {
+    var data = null
+    try { data = JSON.parse(text || "{}") } catch (error) { data = null }
+    if (!data) return
+    root.webProvider = String(data.provider || "keyless")
+    root.webKeySet = data.keySet === true
+  }
+
+  // Choosing a provider that needs a key opens the key field instead of saving a
+  // service that cannot answer.
+  function setWebProvider(name) {
+    if (name === "keyless") {
+      root.pendingProvider = ""
+      root.pendingKey = ""
+      root.webConfigCommand = [root.lookCtl, "web.config", "--provider", "keyless"]
+      Qt.callLater(function() { webConfigProc.running = true })
+      return
+    }
+    root.pendingProvider = name
+  }
+
+  function saveWebKey(key) {
+    var provider = root.pendingProvider
+    if (!provider || !key || !key.trim().length) return
+    root.pendingKey = key.trim()
+    root.webConfigCommand = [root.lookCtl, "web.config", "--provider", provider]
+    Qt.callLater(function() { webConfigProc.running = true })
+    root.pendingProvider = ""
+  }
+
+  Process {
+    id: trustProc
+    onExited: function(exitCode) { root.onTrustSaved(exitCode) }
+  }
+
+  Process {
+    id: webStatusProc
+    command: [root.lookCtl, "web.status", "--json"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onWebStatus(text)
+    }
+  }
+
+  Process {
+    id: webConfigProc
+    command: root.webConfigCommand
+    stdinEnabled: true
+    stderr: StdioCollector { id: webConfigErr; waitForEnd: true }
+    onStarted: {
+      if (!root.pendingKey.length) return
+      webConfigProc.write(root.pendingKey + "\n")
+      root.pendingKey = ""
+    }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.appendNote("WEB SEARCH", "Could not save the search setting: " + (webConfigErr.text || "").trim(), true)
+      }
+      root.refreshWebSearch()
+    }
+  }
+
   Process {
     id: costsProc
     stdout: StdioCollector { id: costsOut; waitForEnd: true }
@@ -3126,6 +3853,7 @@ Item {
 
   Component.onCompleted: {
     root.ensureDirs()
+    root.refreshWebSearch()
     // The agent's tools need the broker; it lives as a child of the shell.
     Qt.callLater(function() { root.ensureDaemon() })
   }
@@ -3147,7 +3875,10 @@ Item {
       runtimeStarting: runtime.running && !runtime.live
       runtimeFault: runtime.faultText
       waiting: runtime.waiting
-      modelLabel: runtime.modelLabel
+      modelLabel: root.shortModelName(runtime.modelLabel)
+      sentHistory: root.questionHistory
+      webProvider: root.webProvider
+      webKeySet: root.webKeySet
       historyModel: sessionModel
       historyReady: root.historyReady
       currentSession: runtime.currentSessionFile
@@ -3159,23 +3890,44 @@ Item {
       actionTitle: root.actionTitle()
       brokerConfirm: root.brokerConfirm
       brokerSummary: root.brokerSummary
+      brokerCapability: root.brokerCapability
+      previewReady: root.previewReady
+      previewUrl: root.previewUrl
+      previewCaption: root.previewCaption
+      mediaImages: root.mediaImages
       brokerActing: root.brokerGrantActive
       grantsOn: root.grantedCount > 0
+      trusted: root.daemonTrusted
       settingsOpen: root.settingsOpen
       settingsState: root.settingsState
       actingFocus: root.actingFocus
       permissionsOpen: root.permissionsOpen
+      welcomeOpen: root.welcomeOpen
+      welcomeState: root.welcomeState
       permissionsState: root.permissionsState
       costsOpen: root.costsOpen
       costsState: root.costsState
       grantLabel: root.grantLabel
       onSettingsRequested: root.openSettings()
+      onWelcomeClosed: root.closeWelcome()
+      onWelcomeAsked: function(prompt) { root.askFromWelcome(prompt) }
+      onWelcomeRequested: root.openWelcome()
       onSettingsClosed: root.closeSettings()
       onSettingsModelChosen: function(role, provider, id) { root.chooseModelFor(role, provider, id) }
       onSettingsAutoChanged: function(on) { root.setAutoChoice(on) }
+      onSettingsWebProviderChosen: function(provider) { root.setWebProvider(provider) }
+      onSettingsWebKeySaved: function(key) { root.saveWebKey(key) }
+      onSettingsTrustChanged: function(on) { root.setTrusted(on) }
+      onSettingsAutoPicksChanged: function(on) { root.setAutoPicks(on) }
       onSettingsLocalOnlyChanged: function(on) { root.setLocalOnlyChoice(on) }
       onSettingsDiscover: root.startLocalDiscovery()
-      onSettingsRefresh: root.refreshModelCatalog()
+      onActingFocusRelease: root.releaseActingFocus()
+      onPreviewRequested: root.requestScreenPreview()
+      onSettingsRefresh: {
+        root.refreshModelCatalog()
+        root.refreshWebSearch()
+        root.refreshSettings()
+      }
       onPermissionsRequested: root.openPermissions()
       onPermissionsClosed: root.closePermissions()
       onPermissionsGrant: function(capability, seconds) { root.grantPermission(capability, seconds) }

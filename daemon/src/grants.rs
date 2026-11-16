@@ -379,6 +379,21 @@ impl Ledger {
         was_live
     }
 
+    /// Does any live grant carry this scope?
+    pub fn has_scope(&self, scope: &str) -> bool {
+        self.grants
+            .values()
+            .any(|grant| grant.scope.as_deref() == Some(scope))
+    }
+
+    /// Remove every grant with this scope. Used to take back what trust granted,
+    /// without touching the grants the person made by hand.
+    pub fn revoke_scoped(&mut self, scope: &str, now_unix: i64) {
+        self.grants
+            .retain(|_, grant| grant.scope.as_deref() != Some(scope));
+        self.prune(now_unix);
+    }
+
     /// A live grant for `capability` usable in `app` (see [`Grant::is_live_for`]).
     pub fn live_for(&self, capability: &str, app: Option<&str>, now_unix: i64) -> Option<Grant> {
         self.grants

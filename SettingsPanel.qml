@@ -17,12 +17,20 @@ FocusScope {
 
   property var state: ({})
   property bool locked: false
-  property string mode: "main"      // main | picker
+  property string mode: "main"      // main | picker | key
+  property string webProvider: "keyless"
+  property bool webKeySet: false
+  property bool trusted: false
+  property string keyText: ""
+  // The provider being configured, before the switch is written.
+  property string pendingProvider: ""
   property string pickRole: ""      // default | fast | best | local
   property int selected: 0
   property int pickIndex: 0
 
   signal close()
+  signal welcomeRequested()
+  signal setAutoPicks(bool on)
   signal chooseModel(string role, string provider, string id)
   signal setAuto(bool on)
   signal setLocalOnly(bool on)
@@ -30,6 +38,9 @@ FocusScope {
   signal openCosts()
   signal discover()
   signal refresh()
+  signal setWebProvider(string provider)
+  signal saveWebKey(string key)
+  signal setTrust(bool on)
 
   readonly property var st: root.state && typeof root.state === "object" ? root.state : ({})
   readonly property var models: root.st.models ? root.st.models : []
@@ -60,7 +71,7 @@ FocusScope {
   readonly property string fontFamily: Style.font.menuFamily
 
   readonly property int rowHeight: Style.space(46)
-  readonly property int sectionHeight: Style.space(30)
+  readonly property int sectionHeight: Style.space(44)
   readonly property int pickerRowHeight: Style.space(42)
 
   function rowHeightOf(row) {
@@ -125,6 +136,16 @@ FocusScope {
     }
 
     list.push({
+      kind: "toggle", key: "autoPicks",
+      label: "Choose models for me",
+      detail: "Empty tiers are picked from your catalog, inside these limits"
+        + (s.guardrailSummary ? ": " + s.guardrailSummary : "."),
+      value: s.autoPicks === true ? "ON" : "OFF",
+      on: s.autoPicks === true,
+      enabled: !root.locked
+    })
+
+    list.push({
       kind: "toggle", key: "auto",
       label: "Automatic model choice",
       detail: s.auto === true
@@ -143,25 +164,37 @@ FocusScope {
       list.push({
         kind: "action", key: "fast", role: "fast",
         label: "Fast model",
-        detail: "Short questions. A free or local model fits here.",
+        detail: String(s.fastWarning || "").length ? String(s.fastWarning)
+          : "Short questions. A free or local model fits here.",
         value: s.fast ? s.fast.name : "Not set",
         enabled: !!s.fast && !root.locked
       })
       list.push({
         kind: "action", key: "best", role: "best",
         label: "Best model",
-        detail: "Longer, visual or desktop requests.",
+        detail: String(s.bestWarning || "").length ? String(s.bestWarning)
+          : "Longer, visual and desktop requests.",
         value: s.best ? s.best.name : "Not set",
         enabled: !!s.best && !root.locked
       })
     }
 
     list.push({
+      kind: "action", key: "screen", role: "screen",
+      label: "Screen model",
+      detail: String(s.screenWarning || "").length ? String(s.screenWarning)
+        : "Seeing and driving a window: clicks, typing, menus.",
+      value: s.screen ? s.screen.name : "Not set",
+      enabled: !!s.screen && !root.locked
+    })
+
+    list.push({
       kind: "action", key: "local", role: "local",
       label: "On this computer",
       detail: s.local ? "Runs locally · nothing leaves the machine."
-        : "No local model yet. Find one below.",
-      value: s.local ? s.local.name : "Find",
+        : (root.localModelCount() > 0 ? "On this machine. Nothing leaves it."
+          : "No local model yet. Find one below."),
+      value: s.local ? s.local.name : (root.localModelCount() > 0 ? "Choose" : "Find"),
       enabled: !root.locked
     })
     list.push({
@@ -190,11 +223,57 @@ FocusScope {
 
     list.push({ kind: "section", label: "DESKTOP" })
     list.push({
+      kind: "action", key: "welcome",
+      label: "Welcome screen",
+      detail: "What is set up, and what to try first.",
+      value: "Show",
+      enabled: !root.locked
+    })
+    list.push({
       kind: "toggle", key: "desktopWidget",
       label: "Companion card",
-      detail: "Off by default. The small card in the bottom-right corner; the bar diamond is always there.",
+      detail: "Off by default. The bar diamond is always there.",
       value: s.desktopWidget === true ? "ON" : "OFF",
       on: s.desktopWidget === true,
+      enabled: !root.locked
+    })
+
+    // Search is what people ask an assistant for, and the free indexes have a
+    // ceiling. One row for the service, one for the key, nothing else.
+    var providerLabel = root.webProvider === "you" ? "You.com"
+      : root.webProvider === "brave" ? "Brave Search"
+      : root.webProvider === "tavily" ? "Tavily"
+      : root.webProvider === "serper" ? "Serper (Google)"
+      : "Built-in, no key"
+
+    list.push({ kind: "section", label: "WEB SEARCH" })
+    list.push({
+      kind: "action", key: "webProvider", role: "webProvider",
+      label: "Search service",
+      detail: root.webProvider === "keyless"
+        ? "A news feed and Wikipedia. No account, finds less."
+        : "A real web index, with page text in each result.",
+      value: providerLabel,
+      enabled: !root.locked
+    })
+    list.push({
+      kind: "action", key: "webKey",
+      label: "API key",
+      detail: root.webProvider === "keyless"
+        ? "Choose a search service first."
+        : "Stored on this machine only, readable by you alone.",
+      value: root.webKeySet ? "Set" : "Not set",
+      enabled: !root.locked && root.webProvider !== "keyless"
+    })
+
+    list.push({
+      kind: "toggle", key: "trust",
+      label: "Trust this machine",
+      detail: root.trusted
+        ? "Nothing asks. Every call is still written to the audit."
+        : "Each capability asks the card first. Turn this on for a machine you own.",
+      value: root.trusted ? "ON" : "OFF",
+      on: root.trusted,
       enabled: !root.locked
     })
 
@@ -235,6 +314,20 @@ FocusScope {
   // The role whose models the picker is showing.
   readonly property var pickerModels: {
     var role = root.pickRole
+    if (role === "webProvider") {
+      return [
+        { key: "keyless", name: "Built-in", providerLabel: "news + wikipedia",
+          tags: root.webProvider === "keyless" ? ["IN USE"] : [] },
+        { key: "you", name: "You.com", providerLabel: "api.you.com · recommended",
+          tags: root.webProvider === "you" ? ["IN USE"] : [] },
+        { key: "brave", name: "Brave Search", providerLabel: "api.search.brave.com",
+          tags: root.webProvider === "brave" ? ["IN USE"] : [] },
+        { key: "tavily", name: "Tavily", providerLabel: "api.tavily.com",
+          tags: root.webProvider === "tavily" ? ["IN USE"] : [] },
+        { key: "serper", name: "Serper", providerLabel: "google.serper.dev",
+          tags: root.webProvider === "serper" ? ["IN USE"] : [] }
+      ]
+    }
     var list = []
     for (var i = 0; i < root.models.length; i++) {
       var m = root.models[i]
@@ -256,7 +349,28 @@ FocusScope {
     return out.join(" · ")
   }
 
+  // Local models in the catalog, whether or not one is chosen yet.
+  function localModelCount() {
+    var list = root.models || []
+    var count = 0
+    for (var i = 0; i < list.length; i++) if (list[i] && list[i].local === true) count += 1
+    return count
+  }
+
+  function providerName() {
+    // The provider being configured, not the one saved: the key field opens
+    // before the switch is written.
+    var name = String(root.pendingProvider || "").length
+      ? String(root.pendingProvider) : root.webProvider
+    if (name === "you") return "You.com"
+    if (name === "brave") return "Brave Search"
+    if (name === "tavily") return "Tavily"
+    if (name === "serper") return "Serper"
+    return "the built-in search"
+  }
+
   function pickerTitle() {
+    if (root.pickRole === "webProvider") return "SEARCH SERVICE"
     if (root.pickRole === "fast") return "FAST MODEL"
     if (root.pickRole === "best") return "BEST MODEL"
     if (root.pickRole === "local") return "ON THIS COMPUTER"
@@ -264,6 +378,8 @@ FocusScope {
   }
 
   function pickerDetail() {
+    if (root.pickRole === "webProvider")
+      return "You.com is the one built for agents. Brave, Tavily and Serper also work. Built-in needs no key and finds less."
     if (root.pickRole === "fast") return "Used for short questions. A free or local model is a good fit."
     if (root.pickRole === "best") return "Used for longer, visual or desktop requests."
     if (root.pickRole === "local") return "Runs on this computer. Nothing is sent to a cloud model."
@@ -294,11 +410,34 @@ FocusScope {
     root.ensureVisible()
   }
 
+  function commitKey() {
+    var key = String(root.keyText || "").trim()
+    if (!key.length) return
+    root.saveWebKey(key)
+    root.keyText = ""
+    // Back to the row that opened it, so the new value is visible.
+    for (var i = 0; i < root.rows.length; i++) {
+      if (root.rows[i].key === "webKey") { root.selected = i; break }
+    }
+    root.mode = "main"
+    root.forceActiveFocus()
+  }
+
   function choose() {
     if (root.mode === "picker") {
       if (root.locked || !root.pickerModels.length) return
       var model = root.pickerModels[Math.max(0, Math.min(root.pickIndex, root.pickerModels.length - 1))]
       if (!model) return
+      if (root.pickRole === "webProvider") {
+        // Switching service without a key would leave a service that cannot
+        // answer, so a provider that needs one opens the key field next.
+        root.pendingProvider = model.key === "keyless" ? "" : String(model.key)
+        root.setWebProvider(String(model.key))
+        root.keyText = ""
+        root.mode = model.key === "keyless" ? "main" : "key"
+        root.forceActiveFocus()
+        return
+      }
       root.chooseModel(root.pickRole, model.provider, model.id)
       root.closePicker()
       return
@@ -307,14 +446,24 @@ FocusScope {
     if (!row || !row.enabled) return
     if (row.kind === "toggle") {
       if (row.key === "auto") root.setAuto(row.on !== true)
+      else if (row.key === "autoPicks") root.setAutoPicks(row.on !== true)
       else if (row.key === "localOnly") root.setLocalOnly(row.on !== true)
       else if (row.key === "desktopWidget") root.setDesktopWidget(row.on !== true)
+      else if (row.key === "welcome") root.welcomeRequested()
+      else if (row.key === "trust") root.setTrust(row.on !== true)
       return
     }
     if (row.kind === "action") {
       if (row.key === "costs") root.openCosts()
       else if (row.key === "find") root.discover()
-      else if (row.key === "local" && !root.st.localAvailable) root.discover()
+      // "On this computer" opens the list whenever there is something to pick.
+      // Only a machine with nothing local at all goes looking for a server.
+      else if (row.key === "local" && root.localModelCount() === 0) root.discover()
+      else if (row.key === "webKey") {
+        root.keyText = ""
+        root.mode = "key"
+        root.forceActiveFocus()
+      }
       else if (row.role) root.openPicker(row.role)
     }
   }
@@ -328,6 +477,7 @@ FocusScope {
   Keys.onPressed: function(event) {
     if (event.key === Qt.Key_Escape) {
       if (root.mode === "picker") root.closePicker()
+      else if (root.mode === "key") root.mode = "main"
       else root.close()
       event.accepted = true
       return
@@ -350,7 +500,12 @@ FocusScope {
     }
   }
 
-  Component.onCompleted: root.forceActiveFocus()
+  // The sheet reads live state; ask for it when it opens rather than trusting
+  // whatever was true when the card was last closed.
+  Component.onCompleted: {
+    root.forceActiveFocus()
+    root.refresh()
+  }
 
   Rectangle {
     anchors.fill: parent
@@ -369,11 +524,52 @@ FocusScope {
     anchors.right: parent.right
     height: root.mode === "picker" ? Style.space(54) : Style.space(28)
 
-    Text {
+    // A back affordance, not only the Esc key: the sheets are the one place a
+    // person can end up somewhere they did not mean to be.
+    Item {
+      id: backButton
       anchors.left: parent.left
       anchors.top: parent.top
+      width: Style.space(22)
+      height: Style.space(22)
+
+      Rectangle {
+        anchors.fill: parent
+        radius: Style.space(4)
+        color: backMouse.containsMouse ? Commons.Color.menu.selectedBackground : "transparent"
+      }
+
+      Text {
+        anchors.centerIn: parent
+        textFormat: Text.PlainText
+        text: "‹"
+        color: backMouse.containsMouse ? root.accent : root.textSecondary
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.heading
+      }
+
+      MouseArea {
+        id: backMouse
+        anchors.fill: parent
+        hoverEnabled: true
+        cursorShape: Qt.PointingHandCursor
+        onClicked: {
+          if (root.mode === "picker") root.closePicker()
+          else if (root.mode === "key") root.mode = "main"
+          else root.close()
+        }
+      }
+    }
+
+    Text {
+      anchors.left: backButton.right
+      anchors.leftMargin: Style.space(8)
+      anchors.top: parent.top
+      anchors.topMargin: Style.space(3)
       textFormat: Text.PlainText
-      text: root.mode === "picker" ? root.pickerTitle() : "SETTINGS"
+      text: root.mode === "picker" ? root.pickerTitle()
+        : root.mode === "key" ? "SEARCH KEY"
+        : "SETTINGS"
       color: root.foreground
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
@@ -396,6 +592,7 @@ FocusScope {
         cursorShape: Qt.PointingHandCursor
         onClicked: {
           if (root.mode === "picker") root.closePicker()
+          else if (root.mode === "key") root.mode = "main"
           else root.close()
         }
       }
@@ -406,9 +603,11 @@ FocusScope {
       anchors.right: parent.right
       anchors.top: parent.top
       anchors.topMargin: Style.space(18)
-      visible: root.mode === "picker"
+      visible: root.mode === "picker" || root.mode === "key"
       textFormat: Text.PlainText
-      text: root.pickerDetail()
+      text: root.mode === "key"
+        ? "Paste the key for " + root.providerName() + ". It is stored on this machine."
+        : root.pickerDetail()
       color: root.textSecondary
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
@@ -515,8 +714,8 @@ FocusScope {
             anchors.left: parent.left
             anchors.right: rowValue.left
             anchors.rightMargin: Style.space(10)
-            anchors.bottom: parent.verticalCenter
-            anchors.bottomMargin: Style.space(1)
+            anchors.bottom: row.kind === "section" ? parent.bottom : parent.verticalCenter
+            anchors.bottomMargin: row.kind === "section" ? Style.space(8) : Style.space(1)
             textFormat: Text.PlainText
             text: row.label
             color: row.enabled === false ? root.textTertiary : root.foreground
@@ -557,7 +756,9 @@ FocusScope {
             font.bold: row.kind === "toggle"
             horizontalAlignment: Text.AlignRight
             elide: Text.ElideLeft
-            width: Math.min(implicitWidth, parent.width * 0.48)
+            wrapMode: Text.NoWrap
+            maximumLineCount: 1
+            width: Math.min(implicitWidth, parent.width * 0.44)
           }
 
           MouseArea {
@@ -573,6 +774,75 @@ FocusScope {
         }
       }
 
+    }
+  }
+
+  // The key field. A separate mode rather than a row, because it takes real
+  // typing and it is the one place in the sheet where a secret is entered.
+  Item {
+    id: keyPane
+    visible: root.mode === "key"
+    anchors.top: settingsHeader.bottom
+    anchors.left: parent.left
+    anchors.right: parent.right
+    anchors.bottom: settingsFooter.top
+    anchors.topMargin: Style.space(14)
+
+    Rectangle {
+      id: keyField
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: parent.top
+      height: Style.space(34)
+      radius: Style.space(4)
+      color: Commons.Util.alpha(root.foreground, 0.06)
+      border.color: keyInput.activeFocus ? root.accent : root.separator
+      border.width: 1
+
+      TextInput {
+        id: keyInput
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(10)
+        anchors.rightMargin: Style.space(10)
+        verticalAlignment: TextInput.AlignVCenter
+        text: root.keyText
+        onTextChanged: root.keyText = text
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        selectionColor: Commons.Util.alpha(root.accent, 0.4)
+        selectedTextColor: root.foreground
+        echoMode: TextInput.Password
+        passwordCharacter: "•"
+        focus: true
+        clip: true
+        onAccepted: root.commitKey()
+      }
+
+      Text {
+        anchors.fill: parent
+        anchors.leftMargin: Style.space(10)
+        verticalAlignment: Text.AlignVCenter
+        visible: keyInput.text.length === 0
+        textFormat: Text.PlainText
+        text: "paste the key, then Enter"
+        color: root.textTertiary
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+      }
+    }
+
+    Text {
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.top: keyField.bottom
+      anchors.topMargin: Style.space(10)
+      textFormat: Text.PlainText
+      text: "Nothing is sent anywhere except to the service itself, and the key is not written into the audit log."
+      color: root.textTertiary
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      wrapMode: Text.Wrap
     }
   }
 
@@ -727,6 +997,7 @@ FocusScope {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
       text: root.mode === "picker" ? "↑↓ CHOOSE  ·  ENTER SELECT  ·  ESC BACK"
+        : root.mode === "key" ? "ENTER SAVE  ·  ESC BACK"
         : "↑↓ MOVE  ·  ENTER SELECT  ·  ESC CLOSE"
       color: root.textTertiary
       font.family: root.fontFamily
