@@ -185,7 +185,9 @@ impl Broker {
             "act.pointer" => self.act_pointer(&request.params, now),
             "act.clipboard" => self.act_clipboard(&request.params, now),
             "act.launch" => self.act_launch(&request.params, now),
+            "app.list" => self.app_list(),
             "shell.run" => self.shell_run(&request.params, now),
+            "shell.exec" => self.shell_exec(&request.params, now),
             "consent.grant" => self.consent_grant(&request.params, now),
             "consent.revoke" => self.consent_revoke(&request.params, now),
             "consent.list" => self.consent_list(now),
@@ -198,7 +200,8 @@ impl Broker {
                 ErrorCode::UnknownMethod,
                 format!(
                     "unknown method \"{}\"; this daemon knows ping, capabilities, observe.screen, \
-                     act.type, act.key, act.pointer, act.clipboard, act.launch, shell.run, \
+                     act.type, act.key, act.pointer, act.clipboard, act.launch, app.list, \
+                     shell.run, shell.exec, \
                      consent.grant, consent.revoke, \
                      consent.list, consent.pending, consent.decide, consent.revoke_run, \
                      consent.revoke_all and audit.tail",
@@ -643,17 +646,35 @@ impl Broker {
         now: OffsetDateTime,
         trace: &mut Trace,
     ) -> Result<Value, ApiError> {
-        // Validate before consent: a refused call starts nothing.
-        let action = required_text(params, "act.launch", "action")?;
-        let action = crate::act::launch_action(action)?;
-        trace.action = Some(action.to_string());
-
-        // Which app this verb opens is decided here, from the person's own settings, before
-        // consent is asked: the confirmation should name the app that will actually open.
-        let app = self.launch_app(action)?;
-        let summary = match &app {
-            LaunchApp::Command => format!("Open the {action}"),
-            LaunchApp::Desktop(id) => format!("Open {}", crate::launch::display_name(id)),
+        // Two shapes: a fixed verb (`action`), or any app this machine has (`app`, a desktop
+        // id). Both are validated before consent, so a refused call starts nothing.
+        let requested_app = optional_text(params, "app")?;
+        let (action, app, summary) = match requested_app {
+            Some(raw) => {
+                let id = crate::launch::validate_desktop_id(raw)?;
+                if !crate::launch::is_installed(&id) {
+                    return Err(ApiError::invalid(format!(
+                        "{} is not installed on this machine; app.list shows what is",
+                        one_line(&id, 64)
+                    )));
+                }
+                trace.action = Some(id.clone());
+                let summary = format!("Open {}", crate::launch::display_name(&id));
+                (None, LaunchApp::Desktop(id), summary)
+            }
+            None => {
+                let action = required_text(params, "act.launch", "action")?;
+                let action = crate::act::launch_action(action)?;
+                trace.action = Some(action.to_string());
+                // Which app this verb opens is decided here, from the person's own settings,
+                // before consent is asked: the confirmation should name the app that opens.
+                let app = self.launch_app(action)?;
+                let summary = match &app {
+                    LaunchApp::Command => format!("Open the {action}"),
+                    LaunchApp::Desktop(id) => format!("Open {}", crate::launch::display_name(id)),
+                };
+                (Some(action), app, summary)
+            }
         };
 
         let now_unix = now.unix_timestamp();
@@ -670,10 +691,12 @@ impl Broker {
         )?;
 
         match &app {
-            LaunchApp::Command => self.actor.launch(action)?,
+            LaunchApp::Command => self
+                .actor
+                .launch(action.ok_or_else(|| ApiError::internal("a launch verb went missing"))?)?,
             LaunchApp::Desktop(id) => {
                 self.actor.launch_desktop(id)?;
-                // "Open the mail app" has to mean the window is in front of the person.
+                // "Open the app" has to mean the window is in front of the person:
                 // gtk-launch activates an app that is already running, and a minimized
                 // one stays on Omarchy's hidden workspace until someone fetches it.
                 self.actor.raise_app(&crate::launch::app_name(id))?;
@@ -684,9 +707,87 @@ impl Broker {
             "method": "act.launch",
             "action": action,
             "app": match &app {
-                LaunchApp::Command => action,
+                LaunchApp::Command => action.unwrap_or_default(),
                 LaunchApp::Desktop(id) => id.as_str(),
             },
+        }))
+    }
+
+    /// `app.list`: the desktop entries this machine has. Read-only, no grant.
+    fn app_list(&self) -> Result<Value, ApiError> {
+        let apps: Vec<Value> = crate::launch::installed_apps()
+            .into_iter()
+            .map(|app| json!({ "id": app.id, "name": app.name }))
+            .collect();
+        Ok(json!({ "apps": apps }))
+    }
+
+    /// `shell.exec`: run one command in the person's own shell. Capability `shell.exec`.
+    fn shell_exec(
+        &self,
+        params: &Map<String, Value>,
+        now: OffsetDateTime,
+    ) -> Result<Value, ApiError> {
+        self.audited("shell.exec", now, |trace| {
+            trace.capability = Some(caps::SHELL_EXEC.name.to_string());
+            self.run_shell_exec(params, now, trace)
+        })
+    }
+
+    fn run_shell_exec(
+        &self,
+        params: &Map<String, Value>,
+        now: OffsetDateTime,
+        trace: &mut Trace,
+    ) -> Result<Value, ApiError> {
+        let command = required_text(params, "shell.exec", "command")?;
+        let command = crate::act::validate_command(command)?;
+        // The audit keeps the program, never the whole command line: that line can
+        // carry a path or a value the person would not want written down.
+        trace.action = Some(crate::act::command_program(&command));
+        trace.chars = Some(command.chars().count() as u64);
+
+        let cwd = match optional_text(params, "cwd")? {
+            Some(dir) => crate::act::validate_working_dir(dir)?,
+            None => crate::act::default_working_dir()?,
+        };
+        let timeout = match params.get("timeoutSeconds") {
+            None | Some(Value::Null) => crate::act::DEFAULT_EXEC_SECONDS,
+            Some(value) => value
+                .as_u64()
+                .filter(|seconds| (1..=crate::act::MAX_EXEC_SECONDS).contains(seconds))
+                .ok_or_else(|| {
+                    ApiError::invalid(format!(
+                        "\"timeoutSeconds\" must be a whole number from 1 to {}",
+                        crate::act::MAX_EXEC_SECONDS
+                    ))
+                })?,
+        };
+
+        let summary = format!("Run in {}: {}", cwd.display(), one_line(&command, 200));
+        let now_unix = now.unix_timestamp();
+        let grant = self.require_grant_interactive(
+            &caps::SHELL_EXEC,
+            "one command",
+            wants_confirmation(params),
+            summary,
+            "shell.exec",
+            None,
+            AllowPolicy::Once,
+            trace,
+            now_unix,
+        )?;
+
+        let output = self.actor.run_command(&command, &cwd, timeout)?;
+        self.charge(&grant, caps::SHELL_EXEC.name, now_unix)?;
+        Ok(json!({
+            "method": "shell.exec",
+            "command": command,
+            "cwd": cwd.display().to_string(),
+            "exitCode": output.status,
+            "timedOut": output.timed_out,
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
         }))
     }
 
@@ -1477,6 +1578,19 @@ fn scroll_words(dx: i32, dy: i32) -> String {
 }
 
 /// A required string parameter, refused with `invalid_params` when it is missing or not a string.
+/// An optional string parameter: absent and `null` both mean "not given".
+fn optional_text<'a>(
+    params: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, ApiError> {
+    match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) if text.trim().is_empty() => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.as_str())),
+        Some(_) => Err(ApiError::invalid(format!("\"{field}\" must be a string"))),
+    }
+}
+
 fn required_text<'a>(
     params: &'a Map<String, Value>,
     method: &str,
@@ -1638,7 +1752,7 @@ mod tests {
 
         let caps = call(&broker, "capabilities", Value::Null).unwrap();
         let list = caps["capabilities"].as_array().unwrap();
-        assert_eq!(list.len(), 7);
+        assert_eq!(list.len(), 8);
         assert_eq!(list[0]["name"], Value::String("observe.screen".into()));
         assert_eq!(list[0]["grant"], Value::Null);
         assert_eq!(list[1]["name"], Value::String("act.type".into()));
@@ -1647,6 +1761,7 @@ mod tests {
         assert_eq!(list[4]["name"], Value::String("act.clipboard".into()));
         assert_eq!(list[5]["name"], Value::String("act.launch".into()));
         assert_eq!(list[6]["name"], Value::String("shell.run".into()));
+        assert_eq!(list[7]["name"], Value::String("shell.exec".into()));
         assert!(list.iter().all(|entry| entry["grant"] == Value::Null));
 
         let err = call(&broker, "browser.open", Value::Null).unwrap_err();

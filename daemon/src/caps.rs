@@ -61,6 +61,17 @@ pub const SHELL_RUN: Capability = Capability {
     description: "Run a named desktop action (lock, volume, brightness, workspace, layout)",
 };
 
+/// `shell.exec`: run one command line in the person's own shell. This is the
+/// capability that makes the assistant as capable as the person at their own
+/// terminal — creating folders, moving files, running git — instead of only the
+/// handful of actions in the fixed tables. It is deny-by-default and every call
+/// is confirmed with the exact command on screen unless the person granted it for
+/// a while.
+pub const SHELL_EXEC: Capability = Capability {
+    name: "shell.exec",
+    description: "Run one command in your shell (with your permissions, never root)",
+};
+
 /// Everything this daemon implements. The browser and mail are not here.
 pub const CAPABILITIES: &[Capability] = &[
     OBSERVE_SCREEN,
@@ -70,6 +81,7 @@ pub const CAPABILITIES: &[Capability] = &[
     ACT_CLIPBOARD,
     ACT_LAUNCH,
     SHELL_RUN,
+    SHELL_EXEC,
 ];
 
 /// Look a capability up by its wire name.
@@ -86,7 +98,7 @@ mod tests {
 
     #[test]
     fn the_registry_is_the_m2_capabilities() {
-        assert_eq!(CAPABILITIES.len(), 7);
+        assert_eq!(CAPABILITIES.len(), 8);
         let capability = find("observe.screen").unwrap();
         assert_eq!(capability.name, "observe.screen");
         assert_eq!(

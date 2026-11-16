@@ -22,10 +22,17 @@ each as its own grant, each audited, all revocable.
 - **Look at the current window.** `Ctrl+O` or `/look` captures the focused window or monitor after
   a visible consent prompt. The card blanks while the shot is taken so the overlay is not in it.
 - **Act, with a grant for each kind of action.** Type, press keys, click and scroll, read/write the
-  clipboard, launch an app, or run a named desktop action. `shell.run` is a fixed table (lock,
-  volume, brightness, workspace, layout, fullscreen/maximize/restore); there is no arbitrary shell
-  and no caller-supplied program. Looking at the screen is `observe.screen`, not a screenshot
-  action: the capture is brokered and audited instead of opening a picker.
+  clipboard, open any installed app, run one command in your own shell, or run a named desktop
+  action. `shell.run` stays a fixed table (lock, volume, brightness, workspace, layout,
+  fullscreen/maximize/restore). Looking at the screen is `observe.screen`, not a screenshot action:
+  the capture is brokered and audited instead of opening a picker.
+- **Do what you can do.** `shell.exec` runs one command line in your shell — the one you would type
+  yourself, with your PATH and aliases (`bash -lc`), in the directory you name. Creating folders,
+  moving files, git, reading a log: the same thing your terminal does. Root is not available: `sudo`,
+  `doas`, `pkexec` and `su` are refused, so nothing runs system-wide. One line per call, 60 s by
+  default (up to 5 min), output capped at 64 KiB per stream, and the audit keeps the program and the
+  command's length — never the command line, which can carry a path or a value you would not want
+  written down.
 - **Remember the conversation.** Each conversation is a pi session under
   `~/.local/state/omassistant/pi-sessions/`. The newest session is resumed on shell start; `Ctrl+H`
   switches between them; the transcript is rebuilt from pi's own messages.
@@ -214,6 +221,7 @@ Every capability is separate; grants can be time-limited; the audit is immediate
 | `/clear`, `/stop`, `/settings`, `/permissions`, `/costs` | The obvious shortcuts |
 | `/run <action>` | Run a fixed `shell.run` action |
 | `/open browser\|terminal\|editor\|mail` | Open the app you have for that kind |
+| `/run <action>` | Run a fixed `shell.run` action |
 
 From outside the card:
 
@@ -238,8 +246,11 @@ Seven capabilities, each a separate grant:
 - `act.keys` — press keys and shortcuts in the focused window
 - `act.pointer` — click, double-click, right-click, middle-click, scroll or move inside the focused window
 - `act.clipboard` — read or write the clipboard
-- `act.launch` — open your browser, terminal, editor or mail app, and bring its window to the
-  front (restoring it if it was minimized)
+- `act.launch` — open your browser, terminal, editor or mail app (the four shortcuts), or **any**
+  installed app by its desktop id; an app that is already running is brought to the front
+- `app.list` — the apps this machine has, as desktop ids and names
+- `shell.exec` — run one command in your shell with your permissions (never root); confirmed with
+  the exact command unless you grant it for a while
 - `shell.run` — a fixed table of desktop actions (lock, volume, brightness, workspace, layout,
   fullscreen/maximize/restore)
 

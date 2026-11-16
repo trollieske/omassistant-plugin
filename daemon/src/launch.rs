@@ -26,7 +26,16 @@ use crate::error::{ApiError, ErrorCode};
 use crate::exec::one_line;
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// One desktop entry that is installed on this machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledApp {
+    /// The desktop id (`folio.desktop`), which is what `gtk-launch` wants.
+    pub id: String,
+    /// The name a person sees in the launcher (`Files`).
+    pub name: String,
+}
 
 /// The longest desktop entry id this daemon will accept.
 pub const MAX_DESKTOP_ID_CHARS: usize = 160;
@@ -123,6 +132,117 @@ impl LaunchOverrides {
             mail: pick("mail")?,
         })
     }
+}
+
+/// Every desktop entry this machine has, newest XDG precedence first.
+///
+/// This is the same list the launcher shows, so "open the file manager" means
+/// the app the person actually has, not one name we guessed. Entries marked
+/// `NoDisplay=true` are for helpers and are left out.
+#[must_use]
+pub fn installed_apps() -> Vec<InstalledApp> {
+    installed_apps_in(&data_dirs())
+}
+
+/// [`installed_apps`] against an explicit list of data directories.
+#[must_use]
+pub fn installed_apps_in(dirs: &[PathBuf]) -> Vec<InstalledApp> {
+    let mut apps: Vec<InstalledApp> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir.join("applications")) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("desktop") {
+                continue;
+            }
+            let Some(id) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            // The first copy of an id wins, exactly like the launcher.
+            if seen.iter().any(|known| known == id) {
+                continue;
+            }
+            if validate_desktop_id(id).is_err() {
+                continue;
+            }
+            let Ok(raw) = fs::read_to_string(&path) else {
+                continue;
+            };
+            if raw.lines().any(|line| line.trim() == "NoDisplay=true") {
+                continue;
+            }
+            // Only the [Desktop Entry] group describes the app itself; an action
+            // group's Name is something else.
+            let mut name = String::new();
+            let mut in_entry = false;
+            let mut has_exec = false;
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    in_entry = line == "[Desktop Entry]";
+                    continue;
+                }
+                if !in_entry {
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("Name=") {
+                    if name.is_empty() {
+                        name = value.trim().to_string();
+                    }
+                } else if line.starts_with("Exec=") {
+                    has_exec = true;
+                }
+            }
+            if !has_exec {
+                continue;
+            }
+            seen.push(id.to_string());
+            apps.push(InstalledApp {
+                id: id.to_string(),
+                name: if name.is_empty() {
+                    app_name(id)
+                } else {
+                    one_line(&name, 60)
+                },
+            });
+        }
+    }
+    apps.sort_by_key(|app| app.name.to_lowercase());
+    apps
+}
+
+/// Is this desktop id installed here?
+#[must_use]
+pub fn is_installed(id: &str) -> bool {
+    data_dirs()
+        .iter()
+        .any(|dir| dir.join("applications").join(id).is_file())
+}
+
+/// The XDG data dirs, in the order the desktop reads them.
+fn data_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    match std::env::var_os("XDG_DATA_HOME") {
+        Some(home) if !home.is_empty() => dirs.push(PathBuf::from(home)),
+        _ => {
+            if let Some(home) = std::env::var_os("HOME") {
+                if !home.is_empty() {
+                    dirs.push(PathBuf::from(home).join(".local").join("share"));
+                }
+            }
+        }
+    }
+    let list = std::env::var("XDG_DATA_DIRS")
+        .unwrap_or_else(|_| "/usr/local/share:/usr/share".to_string());
+    for dir in list.split(':') {
+        if !dir.is_empty() {
+            dirs.push(PathBuf::from(dir));
+        }
+    }
+    dirs
 }
 
 /// The app's own name from a desktop id: `io.github.billsecond.mailcraft.desktop`
@@ -244,6 +364,40 @@ mod tests {
             "mailcraft"
         );
         assert_eq!(app_name("HEY.desktop"), "HEY");
+    }
+
+    #[test]
+    fn the_app_list_is_the_launchers_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "omassistant-apps-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let apps = dir.join("applications");
+        fs::create_dir_all(&apps).unwrap();
+        fs::write(
+            apps.join("folio.desktop"),
+            "[Desktop Entry]\nName=Files\nExec=folio %U\nCategories=System;FileManager;\n",
+        )
+        .unwrap();
+        // NoDisplay entries are helpers, not apps a person starts.
+        fs::write(
+            apps.join("helper.desktop"),
+            "[Desktop Entry]\nName=Helper\nExec=helper\nNoDisplay=true\n",
+        )
+        .unwrap();
+        // An id that is not a plain file name is skipped even if the file exists.
+        fs::write(
+            apps.join("bad name.desktop"),
+            "[Desktop Entry]\nName=Bad\nExec=bad\n",
+        )
+        .unwrap();
+
+        let found = installed_apps_in(std::slice::from_ref(&dir));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].id, "folio.desktop");
+        assert_eq!(found[0].name, "Files");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

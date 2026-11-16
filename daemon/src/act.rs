@@ -44,7 +44,7 @@
 //!   text never appears in a process's argv.
 
 use crate::error::{ApiError, ErrorCode};
-use crate::exec::{CommandRunner, one_line};
+use crate::exec::{CommandOutput, CommandRunner, one_line};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,18 @@ pub const LAUNCH_VERBS: &[&str] = &["browser", "terminal", "editor", "mail"];
 
 /// How long a launch may take before it is killed.
 pub const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Default timeout for one `shell.exec` command.
+pub const DEFAULT_EXEC_SECONDS: u64 = 60;
+/// The longest a `shell.exec` command may run.
+pub const MAX_EXEC_SECONDS: u64 = 300;
+/// The most characters a `shell.exec` command may have.
+pub const MAX_COMMAND_CHARS: usize = 4_000;
+/// The most output kept from one `shell.exec` stream.
+pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// Programs that would ask for a password or a root shell. The daemon never
+/// escalates: the promise is the person's own permissions, nothing wider.
+const PRIVILEGED_PROGRAMS: &[&str] = &["sudo", "doas", "pkexec", "su"];
 
 /// Validate a shell action name and return it canonical, without running anything.
 pub fn shell_action(name: &str) -> Result<&'static str, ApiError> {
@@ -337,6 +349,28 @@ impl Actor {
             .split_first()
             .ok_or_else(|| ApiError::internal("a launch action has no program"))?;
         self.spawn(program, args, name)
+    }
+
+    /// Run one command line in the person's own shell, and return its output.
+    ///
+    /// `bash -lc` so the person's own aliases and PATH apply — this is meant to
+    /// be exactly the terminal they would use. The working directory is set by
+    /// a validated `cd` inside that shell; the command itself is arbitrary, which
+    /// is the point of the capability, so consent (in the broker) is what decides
+    /// whether it runs.
+    pub fn run_command(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+        timeout_seconds: u64,
+    ) -> Result<CommandOutput, ApiError> {
+        let script = format!(
+            "cd -- {} && {command}",
+            shell_quote(&cwd.display().to_string())
+        );
+        let timeout = Duration::from_secs(timeout_seconds.clamp(1, MAX_EXEC_SECONDS));
+        let output = self.runner.run("bash", &["-lc", &script], timeout)?;
+        Ok(cap_output(output))
     }
 
     /// Start a desktop entry by id, through `gtk-launch`.
@@ -819,6 +853,98 @@ pub fn parse_focused_window(stdout: &[u8]) -> Result<FocusedWindow, ApiError> {
         width: number("size", 0),
         height: number("size", 1),
     })
+}
+
+/// Check one `shell.exec` command and return it unchanged.
+///
+/// Refused: empty or whitespace-only, longer than [`MAX_COMMAND_CHARS`], any control character (a
+/// command is one line), and anything that starts by asking for root — the daemon runs with the
+/// person's own permissions and never widens them.
+pub fn validate_command(raw: &str) -> Result<String, ApiError> {
+    let command = raw.trim();
+    if command.is_empty() {
+        return Err(ApiError::invalid("a command is required"));
+    }
+    if command.chars().count() > MAX_COMMAND_CHARS {
+        return Err(ApiError::new(
+            ErrorCode::TooLarge,
+            format!("a command may not be longer than {MAX_COMMAND_CHARS} characters"),
+        ));
+    }
+    if command.chars().any(|ch| ch.is_control()) {
+        return Err(ApiError::invalid(
+            "a command must be one line: use && or ; instead of a newline",
+        ));
+    }
+    let program = command_program(command);
+    if PRIVILEGED_PROGRAMS.contains(&program.as_str()) {
+        return Err(ApiError::invalid(format!(
+            "{} needs a password, and Omassistant only ever runs with your own permissions; \
+             nothing was run",
+            one_line(&program, 32)
+        )));
+    }
+    Ok(command.to_string())
+}
+
+/// The program a command starts: the first word after any `VAR=value` prefixes.
+#[must_use]
+pub fn command_program(command: &str) -> String {
+    command
+        .split_whitespace()
+        .find(|word| !word.contains('='))
+        .map(|word| word.trim_matches(|ch| ch == '"' || ch == '\'').to_string())
+        .unwrap_or_default()
+}
+
+/// A directory a command may run in: absolute, existing, and a directory.
+pub fn validate_working_dir(raw: &str) -> Result<std::path::PathBuf, ApiError> {
+    let raw = raw.trim();
+    if !raw.starts_with('/') {
+        return Err(ApiError::invalid(
+            "\"cwd\" must be an absolute path, e.g. /home/you/Documents",
+        ));
+    }
+    if raw.chars().any(|ch| ch.is_control()) {
+        return Err(ApiError::invalid(
+            "\"cwd\" may not contain control characters",
+        ));
+    }
+    let path = std::path::PathBuf::from(raw);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Ok(path),
+        Ok(_) => Err(ApiError::invalid(format!(
+            "{} is not a directory",
+            one_line(raw, 200)
+        ))),
+        Err(_) => Err(ApiError::invalid(format!(
+            "{} does not exist",
+            one_line(raw, 200)
+        ))),
+    }
+}
+
+/// The person's home directory, the default place a command runs.
+pub fn default_working_dir() -> Result<std::path::PathBuf, ApiError> {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => Ok(std::path::PathBuf::from(home)),
+        _ => Err(ApiError::new(
+            ErrorCode::Unavailable,
+            "HOME is not set, so there is no directory to run a command in",
+        )),
+    }
+}
+
+/// One argument quoted for `bash`, safe for any path.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Keep the first [`MAX_OUTPUT_BYTES`] of each stream.
+fn cap_output(mut output: CommandOutput) -> CommandOutput {
+    output.stdout.truncate(MAX_OUTPUT_BYTES);
+    output.stderr.truncate(MAX_OUTPUT_BYTES);
+    output
 }
 
 /// Check the text `act.type` was asked to type, and return its length in characters.

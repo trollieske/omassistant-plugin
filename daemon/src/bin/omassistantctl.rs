@@ -52,6 +52,9 @@ usage: omassistantctl [--socket <path>] [--state-dir <path>] [--json] <command>
   act.clipboard read                    print what is on the clipboard
   act.clipboard write --text <text>|-   put text on the clipboard (- reads stdin)
   act.launch browser|terminal|editor|mail  open the app you have for that kind
+  act.launch --app <id>                 open any installed app by its desktop id
+  app.list                              installed apps: id and display name
+  shell.exec -- <command>               run one command in your shell (asks the card)
   shell.run <action>                    run one named desktop action
                                         (lock, volume-up, volume-down, volume-mute,
                                          brightness-up, brightness-down, next-workspace,
@@ -81,7 +84,17 @@ captures.";
 
 const SCAN: ScanSpec = ScanSpec {
     boolean: &["help", "version", "json", "once", "allow", "deny"],
-    valued: &["socket", "state-dir", "target", "lines", "for", "text"],
+    valued: &[
+        "socket",
+        "state-dir",
+        "target",
+        "lines",
+        "for",
+        "text",
+        "app",
+        "cwd",
+        "timeout",
+    ],
 };
 
 /// Why the CLI stopped.
@@ -245,10 +258,71 @@ fn run() -> Result<(), Failure> {
                 println!("ran \"{}\"", text(&result, "action"));
             }
         }
+        "app.list" => {
+            expect_no_arguments(&arguments)?;
+            let result = call(&mut client, "app.list", None)?;
+            if json {
+                print_json(&result)?;
+            } else {
+                for app in result["apps"].as_array().cloned().unwrap_or_default() {
+                    println!("{}\t{}", text(&app, "name"), text(&app, "id"));
+                }
+            }
+        }
+        "shell.exec" => {
+            let command = arguments.join(" ");
+            if command.trim().is_empty() {
+                return Err(Failure::Usage(
+                    "shell.exec needs a command: shell.exec -- mkdir -p ~/Documents/priv"
+                        .to_string(),
+                ));
+            }
+            let mut params = json!({ "command": command });
+            if let Some(dir) = scanned.value("cwd") {
+                params["cwd"] = json!(dir);
+            }
+            if let Some(seconds) = scanned.value("timeout") {
+                let seconds = seconds.parse::<u64>().map_err(|_| {
+                    Failure::Usage(format!("\"{seconds}\" is not a number of seconds"))
+                })?;
+                params["timeoutSeconds"] = json!(seconds);
+            }
+            let result = call(&mut client, "shell.exec", Some(&params))?;
+            if json {
+                print_json(&result)?;
+            } else {
+                let out = text(&result, "stdout");
+                let err = text(&result, "stderr");
+                print!("{out}");
+                if !err.is_empty() {
+                    eprint!("{err}");
+                }
+                let code = result["exitCode"].as_i64().unwrap_or(-1);
+                if code != 0 {
+                    return Err(Failure::Failed(format!("the command exited with {code}")));
+                }
+            }
+        }
         "act.launch" => {
+            if let Some(app) = scanned.value("app") {
+                if !arguments.is_empty() {
+                    return Err(Failure::Usage(
+                        "act.launch takes either an action or --app <desktop id>, not both"
+                            .to_string(),
+                    ));
+                }
+                let result = call(&mut client, "act.launch", Some(&json!({ "app": app })))?;
+                if json {
+                    print_json(&result)?;
+                } else {
+                    println!("opened \"{}\"", text(&result, "app"));
+                }
+                return Ok(());
+            }
             let action = arguments.first().ok_or_else(|| {
                 Failure::Usage(
-                    "act.launch needs an action: browser, terminal or editor".to_string(),
+                    "act.launch needs an action (browser, terminal, editor, mail) or --app <id>"
+                        .to_string(),
                 )
             })?;
             if arguments.len() > 1 {
