@@ -28,8 +28,9 @@ each as its own grant, each audited, all revocable.
 - **Remember the conversation.** Each conversation is a pi session under
   `~/.local/state/omassistant/pi-sessions/`. The newest session is resumed on shell start; `Ctrl+H`
   switches between them; the transcript is rebuilt from pi's own messages.
-- **Dictate locally.** `Ctrl+D` uses Omarchy's voxtype dictation backend when it is installed. The
-  audio and the transcription stay on the machine.
+- **Dictate.** `Ctrl+D` asks Omarchy for one dictation, so it uses the backend you have set with
+  `omarchy default dictation` — voxtype, Superwhisper or Hex. The card mirrors that backend's own
+  state, so "listening…" is real rather than a guess.
 - **Pick a model without restarting.** Models and keys belong to pi, not Omassistant. The Settings
   sheet lists what pi can already use; setting a model is an RPC call, so the conversation survives.
   Optional automatic routing sends short information questions to a Fast model and longer,
@@ -39,9 +40,10 @@ each as its own grant, each audited, all revocable.
 - **See what it cost.** The COSTS sheet sums provider-reported `usage.cost.total` from pi's own
   session records, per conversation and per model. Missing usage is shown as $0; it is not an
   estimate.
-- **Live in the shell.** A right sidebar that stays out of the way, a bar widget, an optional
-  desktop companion, and a global STOP key. The card releases keyboard focus while an action runs
-  so the target app gets the keys, but the sidebar and STOP stay visible.
+- **Live in the shell.** A right sidebar that stays out of the way, a bar widget, and a global
+  STOP key. A desktop companion card can be turned on in settings; it is off by default, so a new
+  install adds nothing to the desktop but the bar diamond. The card releases keyboard focus while
+  an action runs so the target app gets the keys, but the sidebar and STOP stay visible.
 
 ## How it works
 
@@ -85,7 +87,8 @@ instructions"; the broker still checks the grant. The model can ask; it cannot g
   `wl-copy` and `wl-paste` (clipboard), `curl` (loopback local-model discovery), and the usual
   Omarchy helpers (`omarchy-launch-*`, `omarchy-capture-screenshot`, etc.).
 - **Optional:** ImageMagick (`magick`) for smaller screenshots; `wlrctl` for pointer control;
-  `voxtype` for local dictation; Betterbird for the `mail` launch action.
+  one of the dictation backends Omarchy offers (voxtype, Superwhisper, Hex); Betterbird for the
+  `mail` launch action.
 - A free keybinding for the overlay. The plugin does not register global shortcuts itself.
 
 ## Install
@@ -132,8 +135,9 @@ omarchy pkg aur add wlrctl         # pointer move/click/scroll
 For the `mail` launch action, make sure a `betterbird` binary is on `PATH` (the action calls it
 by name; use another client only after editing the fixed table in `daemon/src/act.rs`).
 
-Set up **voxtype** with Omarchy's own dictation setup if you want `Ctrl+D`; Omassistant reads
-voxtype's state and never bundles or downloads a whisper model.
+Set up dictation with Omarchy's own flow (`omarchy install dictation voxtype`, or Superwhisper)
+if you want `Ctrl+D`. Omassistant reads whichever backend `omarchy default dictation` names and
+never bundles, downloads or configures a model itself.
 
 Set up **pi** with at least one provider. On Omarchy Quattro, run `pi --version` once: the managed
 mise configuration installs it lazily and keeps it updated. If you use another setup, install pi
@@ -343,7 +347,7 @@ rm -rf ~/.local/state/omassistant ~/.config/omassistant
 That deletes the conversation history, screenshots, grants and audit. If you added local models,
 remove the `omassistant-*` providers from `~/.pi/agent/models.json` (a `.omassistant.bak` backup is
 next to it). Remove the Omassistant lines from `~/.config/hypr/hyprland.lua` and run
-`omarchy-restart-shell`. The voxtype files, if you set dictation up, are Omarchy's and are left
+`omarchy-restart-shell`. The dictation files, if you set a backend up, are Omarchy's and are left
 alone.
 
 ## Troubleshooting
@@ -383,8 +387,9 @@ dashboard for billing.
 conversation stays on its model when it is already long; explicit depth or an image can force Best.
 Open Settings to see the resolved roles and the actual current model.
 
-**Dictation does nothing.** `Ctrl+D` uses Omarchy's voxtype backend. Set up voxtype and a model with
-Omarchy's dictation flow; Omassistant only watches voxtype's state file and types the result.
+**Dictation does nothing.** `Ctrl+D` runs `omarchy-dictation toggle`, so it needs a backend chosen
+with `omarchy default dictation` and that backend installed. Check the phrase with
+`omarchy dictation toggle` in a terminal; if that works, so does the card.
 
 **The QML fails to load after an update.** Validate the clone with
 `omarchy plugin validate ~/.config/omarchy/plugins/omassistant`, then `omarchy-restart-shell`. The

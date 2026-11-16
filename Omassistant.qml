@@ -33,7 +33,8 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
-  readonly property string configDir: (Quickshell.env("XDG_CONFIG_HOME") || (root.home + "/.config")) + "/omassistant"
+  readonly property string xdgConfigHome: Quickshell.env("XDG_CONFIG_HOME") || (root.home + "/.config")
+  readonly property string configDir: root.xdgConfigHome + "/omassistant"
   readonly property string configPath: root.configDir + "/config.json"
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (root.home + "/.local/state")) + "/omassistant"
   readonly property string runtimeStateDir: root.runtimeDir.length ? root.runtimeDir + "/omassistant" : ""
@@ -98,7 +99,10 @@ Item {
   // and resumes the newest one on start. Off means every conversation is
   // ephemeral (`--no-session`), as M0 shipped.
   property bool memory: true
-  property bool desktopWidget: true
+  // The companion is opt-in: a small card in the corner of the desktop is the one
+  // surface that is visible without being asked for, and the bar diamond already
+  // offers the same door. Off here means off for a fresh install too.
+  property bool desktopWidget: false
   property bool lookEnabled: true
   property string configuredCtl: ""
   property string configuredDaemon: ""
@@ -165,9 +169,14 @@ Item {
   property string lastQuestion: ""
   property string lastAnswer: ""
   property bool unread: false
-  // Voxtype (Omarchy's dictation backend) writes one word to this file while it
-  // records and transcribes; the card mirrors it instead of guessing.
+  // Dictation follows whatever backend Omarchy is configured to use, read from
+  // `~/.config/omarchy/defaults/dictation` (one word: voxtype, superwhisper,
+  // hex). Voxtype publishes a state file; superwhisper answers `status --bar`.
+  // The card mirrors the backend instead of guessing from a file only one of
+  // them writes.
+  readonly property string dictationBackendFile: root.xdgConfigHome + "/omarchy/defaults/dictation"
   readonly property string dictationStateFile: root.runtimeDir.length ? root.runtimeDir + "/voxtype/state" : ""
+  property string dictationBackend: ""
   property string dictation: "idle"
   readonly property bool dictating: root.dictation === "recording" || root.dictation === "transcribing"
   // The companion's minimized chip is a preference, not a transient.
@@ -807,13 +816,16 @@ Item {
 
   // --- dictation ---------------------------------------------------------
 
-  // Voxtype types the transcription wherever keyboard focus is, which is the
+  // The backend types the transcription wherever keyboard focus is, which is the
   // composer while the overlay is open — so "dictate" needs no insertion code,
   // only a way to start and stop the backend and a place to say it is listening.
+  // `omarchy-dictation` is the dispatcher, so the backend Omarchy is configured
+  // to use is the one that runs: voxtype, superwhisper or hex.
   function toggleDictation() {
     if (root.dictation === "transcribing") return
-    var action = root.dictation === "recording" ? "stop" : "start"
-    omarchyDictation.command = ["omarchy-dictation", action]
+    // `toggle` is the one verb every adapter implements: the backend decides
+    // start or stop, so the card never has to know its own state to be right.
+    omarchyDictation.command = ["omarchy-dictation", "toggle"]
     omarchyDictation.running = true
   }
 
@@ -823,6 +835,15 @@ Item {
     if (value === root.dictation) return
     root.dictation = value
     root.publishState()
+  }
+
+  // superwhisper answers one JSON line per state change (idle → recording →
+  // transcribing → idle); the class field is the state the card speaks.
+  function applySuperwhisperState(raw) {
+    var data = null
+    try { data = JSON.parse(String(raw || "").trim()) } catch (error) { data = null }
+    if (!data || typeof data.class !== "string") return
+    root.applyDictationState(data.class)
   }
 
   // The companion is a preference with teeth: right-click or the settings row
@@ -1346,7 +1367,7 @@ Item {
     root.localThinking = root.cleanString(cfg.localThinking, "low", 20)
     root.prewarm = cfg.prewarm === false ? false : true
     root.memory = cfg.memory === false ? false : true
-    root.desktopWidget = cfg.desktopWidget === false ? false : true
+    root.desktopWidget = cfg.desktopWidget === true
     root.lookEnabled = cfg.look === false ? false : true
     root.configuredCtl = root.cleanString(cfg.daemonCtl, "", 500)
     root.configuredDaemon = root.cleanString(cfg.daemonBin, "", 500)
@@ -2975,14 +2996,44 @@ Item {
     printErrors: false
   }
 
+  // Which backend Omarchy is set to use. Missing (or empty) means the person
+  // has not chosen one; nothing dictation-shaped runs then.
+  FileView {
+    id: dictationBackendView
+    path: root.dictationBackendFile
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.dictationBackend = String(text() || "").trim().toLowerCase()
+    onLoadFailed: root.dictationBackend = ""
+    onFileChanged: reload()
+  }
+
+  // Voxtype publishes its state as one word in a file; only load it when that
+  // is the backend, so a superwhisper machine is not told a stale "idle".
   FileView {
     id: dictationView
-    path: root.dictationStateFile
+    path: root.dictationBackend === "voxtype" ? root.dictationStateFile : ""
     watchChanges: true
     printErrors: false
     onLoaded: root.applyDictationState(text())
     onLoadFailed: root.applyDictationState("idle")
     onFileChanged: reload()
+  }
+
+  // superwhisper has no state file: `status --bar --follow` prints one JSON line
+  // per change, which is the same three words voxtype writes. Kept running only
+  // while that is the configured backend — it is a watcher, not a poll.
+  Process {
+    id: superwhisperState
+    // Only while a surface that shows the state is on screen: reading the status
+    // starts superwhisper's service when it is not running, and the plugin
+    // loading must not do that on a machine that never uses it.
+    running: root.dictationBackend === "superwhisper" && (root.opened || root.desktopWidget)
+    command: ["superwhisper", "status", "--bar", "--follow"]
+    stdout: SplitParser {
+      onRead: function(line) { root.applySuperwhisperState(line) }
+    }
+    onExited: function() { root.applyDictationState("idle") }
   }
 
   FileView {

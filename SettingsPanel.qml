@@ -192,7 +192,7 @@ FocusScope {
     list.push({
       kind: "toggle", key: "desktopWidget",
       label: "Companion card",
-      detail: "The small card in the bottom-right corner. The bar diamond stays.",
+      detail: "Off by default. The small card in the bottom-right corner; the bar diamond is always there.",
       value: s.desktopWidget === true ? "ON" : "OFF",
       on: s.desktopWidget === true,
       enabled: !root.locked
