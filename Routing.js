@@ -300,8 +300,14 @@ function resolveAll(config, catalog, current) {
 // job from driving a GUI, and only the GUI one needs a model that can see what it
 // just did.
 function looksScreenWork(question) {
-  return /\b(screen|window|windows|click|right-click|double-click|scroll|type into|press|menu|button|tab|dialog|desktop|gui|file manager|files app|open the app|in the app|spreadsheet|excel|calc|impress|writer|skjerm|skjermen|vindu|vinduet|klikk|høyreklikk|dobbeltklikk|rul|skriv inn|trykk|meny|menyen|knapp|knappen|fane|fanen|dialog|skrivebord|filutforsker|filbehandler|regneark|åpne appen|i appen)\b/i
-    .test(text(question))
+  var q = text(question)
+  if (/\b(screen|window|windows|click|right-click|double-click|scroll|type into|press|menu|button|tab|dialog|desktop|gui|file manager|files app|open the app|in the app|spreadsheet|excel|calc|impress|writer|skjerm(en|er)?|vindu(et|er)?|klikk|høyreklikk|dobbeltklikk|rul|skriv inn|trykk|meny(en|er)?|knapp(en|er)?|fane(n|r)?|dialog(en|er)?|skrivebord|filutforsker|filbehandler(en)?|regneark(et)?|åpne appen|i appen)\b/i
+      .test(q)) return true
+  // Work inside a named application: an action verb, then "i"/"in" and a
+  // capitalised name that is not the start of the sentence. "Sett opp en mal i
+  // GridCraft" is driving a window; "hvor mange innbyggere i Bergen" is not.
+  if (!looksAction(q)) return false
+  return /\b(?:i|in)\s+[A-ZÆØÅ][\w.+-]{1,}/.test(q.slice(1))
 }
 
 function looksAction(question) {
@@ -309,7 +315,7 @@ function looksAction(question) {
   // exactly the long multi-step work Best exists for. Without these words a
   // "fill out this form" request used to be classified as a quick question and
   // sent to Fast; the Best model was never reached even when it was configured.
-  return /\b(open|launch|click|press|type|paste|copy|screenshot|screen|window|email|browser|terminal|volume|brightness|workspace|lock|play|pause|fill|form|field|submit|slide|slides|deck|presentation|spreadsheet|sheet|table|document|cell|row|column|format|rename|create|make|build|edit|update|add|remove|delete|move|select|choose|story|essay|article|poem|letter|åpne|start|klikk|trykk|skriv|lim|kopier|skjermbilde|skjerm|vindu|epost|e-post|nettleser|terminal|volum|lysstyrke|arbeidsflate|lås|spill|pause|fyll|skjema|send|lysbilde|presentasjon|regneark|tabell|dokument|celle|rad|kolonne|formater|gi nytt navn|lag|lagre|endre|oppdater|legg til|fjern|slett|flytt|velg|fortelling|essay|artikkel|dikt|brev)\b/i
+  return /\b(open|launch|click|press|type|paste|copy|screenshot|screen|window|email|browser|terminal|volume|brightness|workspace|lock|play|pause|fill|form|field|submit|slide|slides|deck|presentation|spreadsheet|sheet|table|document|cell|row|column|format|rename|create|make|build|edit|update|add|remove|delete|move|select|choose|story|essay|article|poem|letter|åpne|start|klikk|trykk|skriv|lim|kopier|skjermbilde|skjerm|vindu|epost|e-post|nettleser|terminal|volum|lysstyrke|arbeidsflate|lås|spill|pause|fyll|skjema|send|lysbilde|presentasjon|regneark|tabell|dokument|celle|rad|kolonne|formater|gi nytt navn|lag|lagre|endre|oppdater|legg til|fjern|slett|flytt|velg|fortelling|essay|artikkel|dikt|brev|sett opp|sette opp|konfigurer|opprett|installer|fyll ut|regn ut|beregn|kalkuler|mal|kjøreliste)\b/i
     .test(text(question))
 }
 
