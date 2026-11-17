@@ -266,6 +266,42 @@ pub struct FocusedWindow {
 }
 
 impl FocusedWindow {
+    /// What an approval binds to: the app class **and** the compositor's address
+    /// for that exact window.
+    ///
+    /// Class alone is not enough. Two windows of the same app are two different
+    /// places to type, and a run-scoped key approval that only named the class
+    /// could be reused in the other one without asking again.
+    #[must_use]
+    pub fn scope(&self) -> String {
+        if self.address.is_empty() {
+            self.class.clone()
+        } else {
+            format!("{}#{}", self.class, self.address)
+        }
+    }
+
+    /// The window a scope names, as something to compare the focused window
+    /// against. Only the class and address are part of the promise, so a rebuilt
+    /// window carries no title and no geometry — [`Self::same_window`] reads only
+    /// the two fields that were approved.
+    #[must_use]
+    pub fn from_scope(scope: &str) -> Option<Self> {
+        let (class, address) = scope.split_once('#').unwrap_or((scope, ""));
+        if class.is_empty() {
+            return None;
+        }
+        Some(Self {
+            class: class.to_string(),
+            address: address.to_string(),
+            title: String::new(),
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        })
+    }
+
     /// Is this the same window as `other`?
     ///
     /// The class is the app the person approved. The address is the exact instance, compared when
@@ -2369,5 +2405,34 @@ mod tests {
         );
         assert!(!window.address.contains('\u{1b}') && !window.address.contains('\u{0}'));
         assert!(window.address.starts_with("0x"), "{}", window.address);
+    }
+    #[test]
+    fn an_approval_rebuilt_from_its_scope_still_names_that_window() {
+        // The scope is what a run grant stores; rebuilding it must give a window
+        // that compares equal to the approved one and unequal to its neighbour.
+        let approved = FocusedWindow::from_scope("foot#0x1").unwrap();
+        assert_eq!(approved.class, "foot");
+        assert_eq!(approved.address, "0x1");
+        assert_eq!(approved.scope(), "foot#0x1");
+        // Geometry and title are not part of the promise.
+        assert_eq!(approved.width, 0);
+
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_window(
+            br#"{"address":"0x1","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"other title"}"#,
+        );
+        // Same window, different title: allowed.
+        actor(&recorder)
+            .press(&Chord::parse("escape").unwrap(), Some(&approved))
+            .unwrap();
+
+        recorder.set_window(
+            br#"{"address":"0x2","mapped":true,"at":[0,0],"size":[800,600],"class":"foot","title":"t"}"#,
+        );
+        let error = actor(&recorder)
+            .press(&Chord::parse("escape").unwrap(), Some(&approved))
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::FocusMoved);
+        assert!(error.message().contains("nothing was pressed"));
     }
 }

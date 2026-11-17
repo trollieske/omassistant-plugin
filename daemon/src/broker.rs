@@ -527,13 +527,19 @@ impl Broker {
         trace.key_count = Some(chord.key_count() as u64);
 
         let interactive = wants_confirmation(params);
-        let mut known = None;
-        if interactive {
-            known = Some(self.focused_window(trace)?);
-        }
-        let summary = match &known {
+        // The window in front of the person right now: what a fresh approval names,
+        // and what a running approval is looked up against. A call that is not
+        // interactive has no approval to place, so it does not read the window
+        // before the consent check — reading it could fail for the wrong reason.
+        let current = if interactive {
+            Some(self.focused_window(trace)?)
+        } else {
+            None
+        };
+        let scope = current.as_ref().map(crate::act::FocusedWindow::scope);
+        let summary = match &current {
             Some(target) => format!(
-                "Press {} in {} (allows keys there for {} s)",
+                "Press {} in {} (allows keys in this window for {} s)",
                 chord.canonical(),
                 target.class,
                 KEY_RUN_SECONDS
@@ -547,22 +553,30 @@ impl Broker {
             interactive,
             summary,
             "act.key",
-            known.as_ref().map(|window| window.class.as_str()),
+            scope.as_deref(),
             AllowPolicy::Run {
                 seconds: KEY_RUN_SECONDS,
-                target: known.as_ref().map(|window| window.class.clone()),
+                target: scope.clone(),
             },
             trace,
             now_unix,
         )?;
-        let target = match &known {
+        let target = match &current {
             Some(target) => target.clone(),
             None => self.focused_window(trace)?,
         };
 
-        // The same re-check as act.type: a 60-second key approval is bound to one window, and
-        // `wtype` follows focus, so the keys only go out if that window still has it.
-        self.actor.press(&chord, known.as_ref())?;
+        // A 60-second key approval is bound to one window — class *and* address, so
+        // a second window of the same app is a different approval. What the keys
+        // are checked against is the window the grant names, not the one that has
+        // focus now: comparing the current window with itself would let a reused
+        // grant follow focus into another window of the same class.
+        let approved = grant
+            .target
+            .as_deref()
+            .and_then(crate::act::FocusedWindow::from_scope)
+            .or_else(|| current.clone());
+        self.actor.press(&chord, approved.as_ref())?;
         self.charge(&grant, caps::ACT_KEYS.name, now_unix)?;
         Ok(json!({
             "method": "act.key",

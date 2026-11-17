@@ -93,9 +93,11 @@ impl Grant {
         now_unix < self.expires_unix
     }
 
-    /// Usable for a call in `app` (the focused window's class, when known)?
-    /// A run-scoped approval is bound to the window it was approved in; manual
-    /// grants are not.
+    /// Usable for a call in `app`?
+    ///
+    /// `app` is what an approval binds to: for keys that is the window's class and
+    /// the compositor's address (`foot#0x1`), so a second window of the same app is
+    /// a different approval. Manual grants are not bound to anything.
     pub fn is_live_for(&self, app: Option<&str>, now_unix: i64) -> bool {
         if !self.is_live(now_unix) {
             return false;
@@ -677,5 +679,36 @@ mod tests {
             err.message()
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+    #[test]
+    fn a_run_grant_is_bound_to_one_window_not_one_app() {
+        let mut ledger = Ledger::default();
+        let now = 1000;
+        ledger
+            .grant_scoped(
+                "act.keys",
+                GrantMode::Standing,
+                60,
+                Some("run"),
+                Some("foot#0x1"),
+                now,
+            )
+            .unwrap();
+
+        // The window that was approved.
+        assert!(
+            ledger
+                .live_for("act.keys", Some("foot#0x1"), now + 1)
+                .is_some()
+        );
+        // Another window of the same app is a different place to type.
+        assert!(
+            ledger
+                .live_for("act.keys", Some("foot#0x2"), now + 1)
+                .is_none()
+        );
+        // And a class-only lookup (an older grant, or a compositor that reports no
+        // address) must not be enough to match an address-bound one.
+        assert!(ledger.live_for("act.keys", Some("foot"), now + 1).is_none());
     }
 }

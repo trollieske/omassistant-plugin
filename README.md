@@ -261,8 +261,11 @@ How it behaves:
 
 - **The first call asks.** The consent names the exact effect and the app/window it applies to.
   Nothing runs before the broker sees an allow.
-- **Keys are window-bound.** A key approval covers the focused window for 60 seconds. Typing is its
-  own grant; a key approval never implies typing. Pointer, clipboard, launch and capture are one
+- **Keys are window-bound, window by window.** A key approval covers *one* window for 60 seconds,
+  and the window is identified by its app class **and** the compositor's address for that exact
+  window (`foot#0x1`). A second terminal, or a second browser window, is a different approval — the
+  grant does not follow focus into it, and even a grant that were reused is checked against the
+  window it named. Typing is its own grant; a key approval never implies typing. Pointer, clipboard, launch and capture are one
   call per confirmation unless you grant a standing grant from the sheet.
 - **Standing grants expire.** The sheet offers 5, 10, 15, 20, 25, 30 or 60 minutes, per capability,
   plus ALLOW EVERYTHING and REVOKE EVERYTHING. A countdown is visible while a grant is live.
