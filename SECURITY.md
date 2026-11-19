@@ -116,6 +116,11 @@ be public: `localhost`, `127/8`,
 a name that resolves into a private range is refused after resolution
 (`only_public_http_urls_are_fetched`). The audit records the host and the length, never the query.
 
+**6b. What is read without a grant.** `capabilities`, `consent.list`, `audit.tail`,
+`app.list`, `ping` and `web.last` are local, read-only views: no grant, because none of
+them acts. `app.list` does disclose this machine's installed desktop entries to the
+model, which is worth knowing and is why it is named here rather than left implicit.
+
 **7. The audit holds no content.** One JSONL line per call with method, outcome, capability, grant
 kind, window class, geometry, byte counts, key counts and error code. Never a window title, prompt,
 answer, typed text, clipboard content, image or search query
