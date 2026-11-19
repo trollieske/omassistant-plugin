@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "omassistant",
   "name": "Omassistant",
-  "version": "0.10.9",
+  "version": "0.10.10",
   "author": "Tom-Erik",
   "description": "A permissioned, screen-aware assistant for the Omarchy desktop.",
   "kinds": [

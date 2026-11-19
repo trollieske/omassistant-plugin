@@ -399,6 +399,17 @@ The COSTS sheet is computed from pi's session records: it sums `usage.cost.total
 per model, and reports what the provider recorded. Missing usage is $0, not an estimate, and the
 report never reads the prompt or answer text. Use it as a provider-billed view, not a budget.
 
+### If the pointer disappears
+
+Omarchy's screensaver can leave `cursor:invisible` set after a lock or a DPMS cycle, so the pointer
+is there and simply not painted (upstream `omacom/omarchy#19120`). It is not Omassistant's bug, but
+the assistant is what you open to ask why the desktop is broken — so it looks once each time it
+opens, and puts the pointer back, with a note saying what happened. To do it by hand:
+
+```sh
+hyprctl eval 'hl.config({ cursor = { invisible = false } })'
+```
+
 ## Privacy and files
 
 Omassistant has no telemetry and no network server. The only network calls are pi's own model

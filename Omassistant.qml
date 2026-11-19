@@ -330,6 +330,7 @@ Item {
   function open(payloadJson) {
     var payload = root.parsePayload(payloadJson)
     root.opened = true
+    root.checkCursor()
     // Opening while a run is under way keeps the app's keyboard, and the watch
     // below is what returns it.
     actingFocusWatchdog.stop()
@@ -1074,6 +1075,27 @@ Item {
     try { data = JSON.parse(String(raw || "").trim()) } catch (error) { data = null }
     if (!data || typeof data.class !== "string") return
     root.applyDictationState(data.class)
+  }
+
+  // Omarchy's screensaver can leave `cursor:invisible` set after a lock or a DPMS
+  // cycle, so the pointer is there and simply not painted (upstream omarchy#19120).
+  // Nothing here can fix the compositor, but the assistant is what the person opens
+  // to ask why their desktop is broken — so it looks, once per opening, and puts the
+  // pointer back if that is the whole problem.
+  function checkCursor() {
+    cursorProbe.command = ["hyprctl", "getoption", "cursor:invisible"]
+    cursorProbe.running = true
+  }
+
+  function onCursorProbe(text) {
+    if (String(text || "").indexOf("bool: true") < 0) return
+    cursorReset.running = true
+  }
+
+  function onCursorReset(exitCode) {
+    if (exitCode === 0) {
+      root.appendNote("CURSOR", "The pointer was hidden by an Omarchy screensaver bug; it is back. (omarchy#19120)", false)
+    }
   }
 
   // The companion is a preference with teeth: right-click or the settings row
@@ -4081,6 +4103,21 @@ Item {
     interval: 1200
     repeat: true
     onTriggered: root.refreshSteps()
+  }
+
+  Process {
+    id: cursorProbe
+    command: ["hyprctl", "getoption", "cursor:invisible"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onCursorProbe(text)
+    }
+  }
+
+  Process {
+    id: cursorReset
+    command: ["hyprctl", "eval", "hl.config({ cursor = { invisible = false } })"]
+    onExited: function(exitCode) { root.onCursorReset(exitCode) }
   }
 
   Process {
