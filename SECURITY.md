@@ -50,7 +50,11 @@ created `0600` (`the_state_tree_and_the_socket_are_private`).
 ## Invariants
 
 **0. An approval shows exactly what runs.** Every consent string is the whole
-operation: the command `shell.exec` will run, and the text `act.type` will type. Both
+operation: the *script* `shell.exec` will run — built by one function
+(`act::command_script`) that both the summary and the executor call, so they cannot
+drift — and the text `act.type` will type. `shell.exec` runs `bash --noprofile
+--norc -c <that script>`: a login shell would run `~/.profile`, `~/.bash_profile`
+and `/etc/profile` first, which is code nobody approved. Both
 are capped at what the card can display in full (300 characters) and a longer
 operation is refused *before* a confirmation is asked for, with the reason. There is
 no truncation between "what you approved" and "what happened".

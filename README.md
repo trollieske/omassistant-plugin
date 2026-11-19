@@ -249,9 +249,10 @@ Nine capabilities, each a separate grant:
 - `act.launch` — open your browser, terminal, editor or mail app (the four shortcuts), or **any**
   installed app by its desktop id; an app that is already running is brought to the front
 - `app.list` — the apps this machine has, as desktop ids and names
-- `shell.exec` — run one command in your shell with your permissions (never root); the card shows
-  the whole command before you approve it, and a command too long to show in full is refused rather
-  than approved unseen (300 characters)
+- `shell.exec` — run one command with your permissions (never root) in a **plain** shell
+  (`bash --noprofile --norc -c`); the card shows the whole script — the `cd` and the command — and a
+  command too long to show in full is refused rather than approved unseen (300 characters). Profile
+  scripts and aliases do not run, so what you read is the whole of what happens
 - `shell.run` — a fixed table of desktop actions (lock, volume, brightness, workspace, layout,
   fullscreen/maximize/restore)
 

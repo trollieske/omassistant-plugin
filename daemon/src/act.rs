@@ -702,12 +702,15 @@ impl Actor {
         cwd: &std::path::Path,
         timeout_seconds: u64,
     ) -> Result<CommandOutput, ApiError> {
-        let script = format!(
-            "cd -- {} && {command}",
-            shell_quote(&cwd.display().to_string())
-        );
+        let script = command_script(command, cwd);
+        // `--noprofile --norc`: the approved string is the whole script. A login
+        // shell (`-l`) would run `~/.profile`, `~/.bash_profile` and
+        // `/etc/profile` first — code the person never saw and never approved. What
+        // is shown is what `bash -c` receives.
         let timeout = Duration::from_secs(timeout_seconds.clamp(1, MAX_EXEC_SECONDS));
-        let output = self.runner.run("bash", &["-lc", &script], timeout)?;
+        let output = self
+            .runner
+            .run("bash", &["--noprofile", "--norc", "-c", &script], timeout)?;
         Ok(cap_output(output))
     }
 
@@ -1274,6 +1277,22 @@ pub fn default_working_dir() -> Result<std::path::PathBuf, ApiError> {
             "HOME is not set, so there is no directory to run a command in",
         )),
     }
+}
+
+/// The exact string `shell.exec` hands to `bash -c`, and the exact string the card
+/// shows before the person approves it.
+///
+/// One function for both is the point: a reviewer found that the consent showed a
+/// command while a *login* shell ran the person's profile files first, so the
+/// approved operation was smaller than the one that ran. Now the script is built
+/// once, displayed verbatim, and executed with `--noprofile --norc`, so there is
+/// nothing between what is read and what happens.
+#[must_use]
+pub fn command_script(command: &str, cwd: &std::path::Path) -> String {
+    format!(
+        "cd -- {} && {command}",
+        shell_quote(&cwd.display().to_string())
+    )
 }
 
 /// One argument quoted for `bash`, safe for any path.

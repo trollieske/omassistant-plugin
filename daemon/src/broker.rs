@@ -809,8 +809,9 @@ impl Broker {
                 })?,
         };
 
-        // No truncation: what the card shows is what runs.
-        let summary = format!("Run in {}: {}", cwd.display(), command);
+        // No truncation, and the same string the actor hands to `bash -c`: what
+        // the card shows is what runs, down to the `cd`.
+        let summary = format!("Run: {}", crate::act::command_script(&command, &cwd));
         let now_unix = now.unix_timestamp();
         let grant = self.require_grant_interactive(
             &caps::SHELL_EXEC,
