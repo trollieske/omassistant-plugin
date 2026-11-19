@@ -65,6 +65,8 @@ Item {
   property bool brokerActing: false
   property bool grantsOn: false
   property bool trusted: false
+  property bool localReachable: false
+  property string localEndpoint: ""
   // The agent is acting: the sidebar stays, but the app owns the keyboard.
   property bool actingFocus: false
   // The model settings sheet, drawn lazily so a broken panel cannot take the
@@ -2030,6 +2032,8 @@ Item {
           item.webProvider = Qt.binding(function() { return root.webProvider })
           item.webKeySet = Qt.binding(function() { return root.webKeySet })
           item.trusted = Qt.binding(function() { return root.trusted })
+          item.localReachable = Qt.binding(function() { return root.localReachable })
+          item.localEndpoint = Qt.binding(function() { return root.localEndpoint })
           item.locked = Qt.binding(function() { return root.busy })
           item.forceActiveFocus()
         }

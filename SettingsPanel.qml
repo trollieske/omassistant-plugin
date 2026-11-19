@@ -21,6 +21,8 @@ FocusScope {
   property string webProvider: "keyless"
   property bool webKeySet: false
   property bool trusted: false
+  property bool localReachable: false
+  property string localEndpoint: ""
   property string keyText: ""
   // The provider being configured, before the switch is written.
   property string pendingProvider: ""
@@ -191,7 +193,13 @@ FocusScope {
     list.push({
       kind: "action", key: "local", role: "local",
       label: "On this computer",
-      detail: s.local ? "Runs locally · nothing leaves the machine."
+      // A local model whose server is stopped is not "on this machine" in any
+      // useful sense, and promising privacy about it would be a lie.
+      detail: s.local
+        ? (root.localReachable ? "Runs locally · nothing leaves the machine."
+          : (root.localEndpoint.length
+            ? "Configured, but nothing answers on " + root.localEndpoint + "."
+            : "Configured, but its server is not running."))
         : (root.localModelCount() > 0 ? "On this machine. Nothing leaves it."
           : "No local model yet. Find one below."),
       value: s.local ? s.local.name : (root.localModelCount() > 0 ? "Choose" : "Find"),

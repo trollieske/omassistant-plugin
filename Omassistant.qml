@@ -236,6 +236,11 @@ Item {
   // or an approval): the pill must not claim "ask first" while it is not true.
   property int grantedCount: 0
   property bool daemonTrusted: false
+  // Does the local model server actually answer? A configured local model whose
+  // server is stopped is still in the list, and the card must not promise
+  // "nothing leaves the machine" about a model that will fail on the first token.
+  property bool localReachable: false
+  property string localEndpoint: ""
   property bool screenGranted: false
   property var grantEntries: []
   property string grantLabel: ""
@@ -3845,6 +3850,26 @@ Item {
 
   function refreshWebSearch() { webStatusProc.running = true }
 
+  // One cheap request to the configured local model's own endpoint, only while the
+  // settings sheet is open. A dead server is a fact worth showing.
+  function refreshLocalHealth() {
+    var model = root.findModel(root.localProvider, root.localModelId)
+    var base = model && String(model.baseUrl || "").length
+      ? String(model.baseUrl) : ""
+    if (!base.length) {
+      root.localReachable = false
+      root.localEndpoint = ""
+      return
+    }
+    root.localEndpoint = base.replace(/^http:\/\//, "").replace(/\/v1\/?$/, "")
+    localHealthProbe.command = ["curl", "-fsS", "--max-time", "2", base.replace(/\/+$/, "") + "/models"]
+    localHealthProbe.running = true
+  }
+
+  function onLocalHealth(exitCode) {
+    root.localReachable = exitCode === 0
+  }
+
   // Trust is a file the broker reads on every call, so flipping it takes effect
   // at once. The card shows it either way; this is only the switch.
   function setTrusted(on) {
@@ -3896,6 +3921,12 @@ Item {
     interval: 1200
     repeat: true
     onTriggered: root.refreshSteps()
+  }
+
+  Process {
+    id: localHealthProbe
+    stdout: StdioCollector { id: localHealthOut; waitForEnd: true }
+    onExited: function(exitCode) { root.onLocalHealth(exitCode) }
   }
 
   Process {
@@ -3986,6 +4017,8 @@ Item {
       brokerActing: root.brokerGrantActive
       grantsOn: root.grantedCount > 0
       trusted: root.daemonTrusted
+      localReachable: root.localReachable
+      localEndpoint: root.localEndpoint
       settingsOpen: root.settingsOpen
       settingsState: root.settingsState
       actingFocus: root.actingFocus
@@ -4013,6 +4046,7 @@ Item {
       onPreviewRequested: root.requestScreenPreview()
       onSettingsRefresh: {
         root.refreshModelCatalog()
+        root.refreshLocalHealth()
         root.refreshWebSearch()
         root.refreshSettings()
       }

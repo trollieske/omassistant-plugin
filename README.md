@@ -521,3 +521,10 @@ MIT OR Apache-2.0. See [LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT) and
 
 Omassistant is an independent community project. It is not an official Omarchy component, and the
 plugin marketplace listing is not a security audit or an endorsement.
+
+## Security
+
+`SECURITY.md` is written for the person reviewing this code: the nine capabilities and what each
+refuses, the invariants (only the broker's tools, an approval names one window, no root, egress as a
+capability, no content in the audit, secrets in one private file), the test that holds each one, and
+what is deliberately out of scope.
