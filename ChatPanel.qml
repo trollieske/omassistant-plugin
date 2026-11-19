@@ -191,7 +191,7 @@ Item {
   // height comes from the text's own painted height — an estimate by character
   // count is how a line or two goes missing at the end of an approval.
   readonly property int composerHeight: root.brokerConfirm
-    ? Math.max(Style.space(40), brokerSummaryText.implicitHeight + Style.space(16))
+    ? Math.max(Style.space(40), brokerSummaryText.contentHeight + Style.space(16))
     : Math.max(Style.space(40), Style.font.heading + Style.spacing.inputPaddingY * 2)
   readonly property int footerHeight: Math.max(Style.space(20), Style.font.caption + Style.spacing.md)
   readonly property int sectionGap: Style.spacing.xxl
@@ -430,7 +430,11 @@ Item {
       else if (ch === "\n") out += "<br/>"
       else out += ch
     }
-    return leading > 0 ? "<div style=\"line-height:" + leading + "px\">" + out + "</div>" : out
+    // `pre-wrap`: runs of spaces are part of the text — what the assistant wrote, or
+    // what the person is about to approve — and HTML collapses them by default.
+    var style = "white-space:pre-wrap"
+    if (leading > 0) style += ";line-height:" + leading + "px"
+    return "<div style=\"" + style + "\">" + out + "</div>"
   }
 
   function scrollToEnd() {
@@ -1749,23 +1753,23 @@ Item {
             font.pixelSize: Style.font.heading
           }
 
-          Text {
+          TextEdit {
             id: brokerSummaryText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(22)
             anchors.right: brokerKeys.left
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
-            textFormat: Text.PlainText
-            // The whole operation, wrapped. An ellipsis here would mean approving
-            // characters nobody saw, which is exactly what the review called out;
-            // the broker caps every operation at what these lines can hold.
-            text: root.brokerSummary
+            // The operation exactly as it will run: a rich block with pre-wrap, so a
+            // run of spaces is not folded the way `Text` folds it. No elide and no
+            // line cap — the row grows, and the broker's caps bound the growth.
+            readOnly: true
+            selectByMouse: true
+            textFormat: TextEdit.RichText
+            wrapMode: TextEdit.Wrap
+            text: root.richBlock(root.brokerSummary, 0)
+            height: contentHeight
             color: root.accent
-            wrapMode: Text.Wrap
-            // No maximumLineCount and no elide: the row grows instead of hiding
-            // characters, and the broker caps the operation so the growth is bounded.
-            elide: Text.ElideNone
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
@@ -1773,7 +1777,7 @@ Item {
 
           Text {
             id: brokerKeys
-            visible: brokerSummaryText.implicitHeight <= Style.space(48)
+            visible: brokerSummaryText.contentHeight <= Style.space(48)
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText

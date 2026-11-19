@@ -56,7 +56,12 @@ drift — plus the text `act.type` will type, the program and arguments a `shell
 action starts, the desktop id `act.launch` hands to `gtk-launch`, the whole text an
 `act.clipboard` write puts on the clipboard, the whole query `web.search` sends, and
 the whole URL `web.fetch` will open, path and query included (the audit keeps the
-host alone).
+host alone). Payloads follow a colon on their own line, with no quotation marks the
+person did not type: a text containing a quote must not make the summary ambiguous
+about where it ends. Window-bound operations name the app class and the window
+title, because two terminals of the same kind are otherwise identical in the card —
+the title is descriptive and is never written to the audit. Text is rendered with
+`white-space: pre-wrap`, so a run of spaces is shown — and copies — as itself.
 `shell.exec` runs `bash --noprofile --norc -c <that script>`: a login shell would
 run `~/.profile`, `~/.bash_profile` and `/etc/profile` first, which is code nobody
 approved. Operations are capped at what the card can display in full — 300
@@ -150,6 +155,10 @@ Stated plainly, because a reviewer should not have to infer it:
 - **Sandboxing.** Actions run with your own permissions, by design — it is your desktop and your
   files. The capability list limits *what the model may ask for*, not what a command can do once you
   approve it. That is why `shell.exec` shows the line first.
+- **Another process running as you.** Any process of yours can talk to the broker's
+  socket, which is how the card answers a confirmation; the same access could answer
+  one without you. The socket is `0600` inside a `0700` directory, so this is the
+  boundary of "you" rather than a hole in the consent flow.
 - **The install script's own inputs.** It builds from the repository it sits in and installs to
   `~/.local/bin`; it does not fetch anything else.
 

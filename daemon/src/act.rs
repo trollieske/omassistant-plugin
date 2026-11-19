@@ -1383,6 +1383,19 @@ pub fn validate_text(text: &str) -> Result<usize, ApiError> {
 /// Unlike `act.type`, empty text is fine — copying nothing is how a person clears the clipboard.
 pub fn validate_clipboard_text(text: &str) -> Result<usize, ApiError> {
     let chars = text.chars().count();
+    // Same rule as typing, and for a sharper reason: the card shows this text before
+    // the person approves it, and a carriage return can make a rendered line look
+    // different from the characters that land on the clipboard.
+    if let Some(bad) = text
+        .chars()
+        .find(|character| character.is_control() && *character != '\n' && *character != '\t')
+    {
+        return Err(ApiError::invalid(format!(
+            "the text contains the control character {}; only newline and tab are allowed in one \
+             clipboard write",
+            crate::exec::one_line(&format!("U+{:04X}", bad as u32), 16)
+        )));
+    }
     if chars > MAX_CLIPBOARD_CHARS {
         return Err(ApiError::new(
             ErrorCode::TooLarge,

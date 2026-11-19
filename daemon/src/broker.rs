@@ -29,21 +29,40 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-/// What a method needs from the outside world, injected so tests need no compositor.
-/// What an `act.type` confirmation says: the text, in full. A preview left the tail
-/// of a paragraph authorised but unseen, which is the finding this closes.
-fn type_summary(class: &str, text: &str) -> String {
-    format!("Type into {class}: \"{text}\"")
+/// What an `act.type` confirmation says: which window, then the text in full.
+///
+/// No quotes around the payload: they would be characters the person did not
+/// approve, and a text containing a quote would make the summary ambiguous about
+/// where it ends. The text goes on its own line, verbatim.
+fn type_summary(window: &crate::act::FocusedWindow, text: &str) -> String {
+    format!("Type into {}:\n{text}", window_label(window))
 }
 
-/// What an `act.clipboard` write says: the text, in full.
+/// What an `act.clipboard` write says: the text, in full, on its own line.
 fn clipboard_summary(text: &str) -> String {
-    format!("Copy to the clipboard: \"{text}\"")
+    format!("Copy to the clipboard:\n{text}")
 }
 
 /// What a `web.search` confirmation says: the query, in full.
 fn search_summary(query: &str) -> String {
     format!("Search the web for: {query}")
+}
+
+/// The window a confirmation is about: the app class the audit keeps, and the title
+/// the person recognises. Two terminals of the same kind are otherwise identical in
+/// the card, and the title is what tells them apart.
+fn window_label(window: &crate::act::FocusedWindow) -> String {
+    window_label_parts(&window.class, &window.title)
+}
+
+/// The same, for the capture path, which carries its own window facts.
+fn window_label_parts(class: &str, title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        class.to_string()
+    } else {
+        format!("{} — \"{}\"", class, crate::exec::one_line(title, 80))
+    }
 }
 
 /// What a `shell.run` confirmation says: the label the person recognises *and* the
@@ -65,11 +84,6 @@ fn shell_run_summary(action: &str) -> Result<String, ApiError> {
 fn fetch_summary(url: &str) -> String {
     format!("Read: {url}")
 }
-
-/// How much of a consent summary is kept. Every operation is capped at what the
-/// card can show (see `MAX_TYPE_CHARS` and `MAX_COMMAND_CHARS` in `act`), so this is
-/// room for the sentence around it, not a place where content is cut off.
-const SUMMARY_CHARS: usize = 900;
 
 /// The scope trust mints its standing grants with. Nothing else uses it, which
 /// is what makes `trust off` able to take back exactly those and nothing more.
@@ -107,6 +121,8 @@ struct PendingRequest {
     decision: Option<bool>,
 }
 
+/// What the broker needs from the outside world, injected so tests need no
+/// compositor, no clock and no tools on the PATH.
 pub struct BrokerConfig {
     /// Socket and state locations.
     pub paths: Paths,
@@ -350,7 +366,10 @@ impl Broker {
             facts = Some(self.capture_facts(target, trace)?);
         }
         let summary = match &facts {
-            Some((Some(window), _)) => format!("Capture the {} window", window.class),
+            Some((Some(window), _)) => format!(
+                "Capture the {} window",
+                window_label_parts(&window.class, &window.title)
+            ),
             Some((None, Some(monitor))) => format!("Capture the whole screen ({})", monitor.name),
             _ => "Capture the screen".to_string(),
         };
@@ -518,7 +537,7 @@ impl Broker {
             known = Some(self.focused_window(trace)?);
         }
         let summary = match &known {
-            Some(target) => type_summary(&target.class, text),
+            Some(target) => type_summary(target, text),
             None => String::new(),
         };
         let now_unix = now.unix_timestamp();
@@ -582,7 +601,7 @@ impl Broker {
             Some(target) => format!(
                 "Press {} in {} (allows keys in this window for {} s)",
                 chord.canonical(),
-                target.class,
+                window_label(target),
                 KEY_RUN_SECONDS
             ),
             None => String::new(),
@@ -664,7 +683,7 @@ impl Broker {
                 scroll_words(dx, dy),
                 percent(nx),
                 percent(ny),
-                target.class
+                window_label(target)
             ),
             (Some(target), "move") => format!(
                 "Move the pointer to {}%, {}% in {}",
@@ -1596,10 +1615,12 @@ impl Broker {
                     id: id.clone(),
                     method: method.to_string(),
                     capability: capability.name.to_string(),
-                    // The dialog shows this string, so it is the whole operation:
-                    // `one_line` only folds whitespace, and the capability caps make
-                    // every operation short enough to fit.
-                    summary: one_line(&summary, SUMMARY_CHARS),
+                    // Stored exactly as built: `one_line` used to fold runs of
+                    // spaces and newlines here, so a command like `printf 'a   b'`
+                    // was displayed as `printf 'a b'` — the person approved a string
+                    // that was not the one that ran. The capability caps are what
+                    // bound the length.
+                    summary,
                     created_unix: now_unix,
                     decision: None,
                 },
@@ -2120,9 +2141,21 @@ mod tests {
     fn no_summary_hides_the_end_of_its_operation() {
         // Every capability at its own limit: the summary has to contain all of it.
         let typing = "x".repeat(crate::act::MAX_TYPE_CHARS);
-        assert!(type_summary("foot", &typing).contains(&typing));
+        let window = crate::act::FocusedWindow {
+            class: "foot".to_string(),
+            address: "0x1".to_string(),
+            title: "omarchy: ~".to_string(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        assert!(type_summary(&window, &typing).contains(&typing));
         let clip = "y".repeat(crate::act::MAX_CLIPBOARD_CHARS);
         assert!(clipboard_summary(&clip).contains(&clip));
+        // No decorative quotes: the payload is the payload, and a text with quotes in
+        // it must not become ambiguous about where it ends.
+        assert!(clipboard_summary("he said \"hi\"").ends_with("he said \"hi\""));
         let query = "q".repeat(crate::web::MAX_QUERY_CHARS);
         assert!(search_summary(&query).contains(&query));
         // And the display cap is what bounds them, so every one fits the row. (Kept
@@ -2138,6 +2171,28 @@ mod tests {
                 "{limit} does not fit"
             );
         }
+    }
+
+    #[test]
+    fn a_window_is_named_by_its_title_not_only_its_app() {
+        let window = crate::act::FocusedWindow {
+            class: "foot".to_string(),
+            address: "0x1".to_string(),
+            title: "omarchy: ~/dev".to_string(),
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        };
+        let label = window_label(&window);
+        assert!(label.starts_with("foot"), "{label}");
+        assert!(label.contains("omarchy: ~/dev"), "{label}");
+        // A window with no title still names something.
+        let bare = crate::act::FocusedWindow {
+            title: String::new(),
+            ..window.clone()
+        };
+        assert_eq!(window_label(&bare), "foot");
     }
 
     #[test]
