@@ -1882,6 +1882,32 @@ mod tests {
     }
 
     #[test]
+    fn a_clipboard_write_cannot_smuggle_layout_characters() {
+        // The card shows this text; a carriage return can make the rendered line look
+        // different from the characters that reach the clipboard.
+        // newline and tab stay allowed: a clipboard write is how a multi-line text
+        // gets somewhere, and neither can hide a line.
+        assert_eq!(
+            validate_clipboard_text("two\nlines\tand a tab").unwrap(),
+            19
+        );
+        for bad in [
+            "carriage\rreturn",
+            "bell\u{7}",
+            "escape\u{1b}[31m",
+            "nul\u{0}",
+        ] {
+            let error = validate_clipboard_text(bad).unwrap_err();
+            assert_eq!(error.code(), ErrorCode::InvalidParams, "for {bad:?}");
+            assert!(
+                error.message().contains("control character"),
+                "{}",
+                error.message()
+            );
+        }
+    }
+
+    #[test]
     fn launches_are_fixed_names_and_fixed_programs() {
         for (name, program) in [
             ("browser", "omarchy-launch-browser"),

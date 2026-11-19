@@ -2151,6 +2151,13 @@ mod tests {
             height: 600,
         };
         assert!(type_summary(&window, &typing).contains(&typing));
+        // A payload with quotes in it must not look like the summary ended early.
+        let quoted = type_summary(&window, "he said \"hi\" then left");
+        assert!(quoted.ends_with("he said \"hi\" then left"), "{quoted:?}");
+        assert!(
+            quoted.contains("Type into foot — \"omarchy: ~\":\n"),
+            "{quoted:?}"
+        );
         let clip = "y".repeat(crate::act::MAX_CLIPBOARD_CHARS);
         assert!(clipboard_summary(&clip).contains(&clip));
         // No decorative quotes: the payload is the payload, and a text with quotes in
