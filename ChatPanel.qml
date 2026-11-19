@@ -402,9 +402,33 @@ Item {
 
   property bool nudge: false
 
+  // Set while the card itself moves the viewport, so "the person scrolled" and
+  // "the answer grew" are not confused.
+  property bool scrollingProgrammatically: false
+
+  // Plain text as one rich-text block whose line height is the number the card
+  // uses. `Text` has the line height but no selection in this Qt; `TextEdit` has
+  // selection and copy but no line height. This is the smallest thing that has
+  // both, and it escapes the three characters that would be read as markup.
+  function richBlock(text, leading) {
+    var value = String(text || "")
+    var out = ""
+    for (var i = 0; i < value.length; i++) {
+      var ch = value.charAt(i)
+      if (ch === "&") out += "&amp;"
+      else if (ch === "<") out += "&lt;"
+      else if (ch === ">") out += "&gt;"
+      else if (ch === "\n") out += "<br/>"
+      else out += ch
+    }
+    return leading > 0 ? "<div style=\"line-height:" + leading + "px\">" + out + "</div>" : out
+  }
+
   function scrollToEnd() {
     var go = function() {
+      root.scrollingProgrammatically = true
       scroller.contentY = Math.max(0, scroller.contentHeight - scroller.height)
+      root.scrollingProgrammatically = false
     }
     go()
     // A delegate that just grew reports its height on the next turn; without this
@@ -1039,9 +1063,20 @@ Item {
           boundsBehavior: Flickable.StopAtBounds
           contentWidth: width
           contentHeight: transcriptColumn.implicitHeight
-          interactive: false
+          // A transcript you cannot scroll is a transcript you cannot read. The
+          // wheel and a drag work here now; following the answer still happens
+          // until the person takes over, and picks up again at the bottom.
+          interactive: true
           onContentHeightChanged: if (root.follow) root.scrollToEnd()
           onHeightChanged: if (root.follow) root.scrollToEnd()
+          onContentYChanged: {
+            if (root.scrollingProgrammatically) return
+            var atEnd = contentY >= contentHeight - height - 2
+            if (atEnd) root.follow = true
+            else if (dragging || flicking) root.follow = false
+          }
+          onMovementStarted: root.follow = false
+          onMovementEnded: root.follow = contentY >= contentHeight - height - 2
 
           Column {
             id: transcriptColumn
@@ -1087,38 +1122,50 @@ Item {
                   color: root.questionFill
                   radius: root.cornerRadius
 
-                  Text {
+                  TextEdit {
                     id: youText
                     x: root.gutter
                     y: Style.spacing.controlPaddingY
                     width: parent.width - root.gutter - Style.spacing.rowPaddingX
-                    textFormat: Text.PlainText
-                    text: row.text
-                    wrapMode: Text.Wrap
+                    height: contentHeight
+                    readOnly: true
+                    selectByMouse: true
+                    persistentSelection: true
+                    cursorVisible: false
+                    clip: false
+                    textFormat: TextEdit.RichText
+                    wrapMode: TextEdit.Wrap
+                    text: root.richBlock(row.text, root.questionLeading)
                     color: root.questionText
+                    selectionColor: Style.selectionFillFor(root.questionText, root.accent)
+                    selectedTextColor: root.questionText
                     font.family: root.fontFamily
                     font.pixelSize: root.bodyFontSize
-                    lineHeightMode: Text.FixedHeight
-                    lineHeight: root.questionLeading
                   }
                 }
 
-                Text {
+                TextEdit {
                   id: answer
                   visible: !row.isQuestion && !row.isNote
                   y: row.topGap
                   x: root.gutter
                   width: parent.width - root.gutter
-                  textFormat: Text.PlainText
                   // The trailing space keeps the wrap stable when the block
                   // cursor leaves at the end of a stream; see streaming below.
-                  text: row.text + (row.streaming ? "▍" : " ")
-                  wrapMode: Text.Wrap
+                  height: contentHeight
+                  readOnly: true
+                  selectByMouse: true
+                  persistentSelection: true
+                  cursorVisible: false
+                  clip: false
+                  textFormat: TextEdit.RichText
+                  wrapMode: TextEdit.Wrap
+                  text: root.richBlock(row.text + (row.streaming ? "▍" : " "), root.bodyLeading)
                   color: root.foreground
+                  selectionColor: Style.selectionFillFor(root.foreground, root.accent)
+                  selectedTextColor: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: root.bodyFontSize
-                  lineHeightMode: Text.FixedHeight
-                  lineHeight: root.bodyLeading
                 }
 
                 Item {
@@ -1895,8 +1942,8 @@ Item {
               event.accepted = true
               return
             }
-            // Ctrl+C stops a run; with no run in flight it means nothing, so
-            // it never throws the conversation away by accident.
+            // Otherwise Ctrl+C stops a run; with no run in flight it means nothing,
+            // so it never throws the conversation away by accident.
             if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier) && !selectedText) {
               if (root.busy) {
                 root.aborted()
