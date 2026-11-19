@@ -30,6 +30,11 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 /// What a method needs from the outside world, injected so tests need no compositor.
+/// How much of a consent summary is kept. Every operation is capped at what the
+/// card can show (see `MAX_TYPE_CHARS` and `MAX_COMMAND_CHARS` in `act`), so this is
+/// room for the sentence around it, not a place where content is cut off.
+const SUMMARY_CHARS: usize = 900;
+
 /// The scope trust mints its standing grants with. Nothing else uses it, which
 /// is what makes `trust off` able to take back exactly those and nothing more.
 const TRUST_SCOPE: &str = "trust";
@@ -804,7 +809,8 @@ impl Broker {
                 })?,
         };
 
-        let summary = format!("Run in {}: {}", cwd.display(), one_line(&command, 200));
+        // No truncation: what the card shows is what runs.
+        let summary = format!("Run in {}: {}", cwd.display(), command);
         let now_unix = now.unix_timestamp();
         let grant = self.require_grant_interactive(
             &caps::SHELL_EXEC,
@@ -1523,7 +1529,10 @@ impl Broker {
                     id: id.clone(),
                     method: method.to_string(),
                     capability: capability.name.to_string(),
-                    summary: one_line(&summary, 200),
+                    // The dialog shows this string, so it is the whole operation:
+                    // `one_line` only folds whitespace, and the capability caps make
+                    // every operation short enough to fit.
+                    summary: one_line(&summary, SUMMARY_CHARS),
                     created_unix: now_unix,
                     decision: None,
                 },

@@ -753,6 +753,31 @@ fn is_public_ip(address: IpAddr) -> bool {
     }
 }
 
+/// Split the body from the status trailer curl appends with `--write-out`.
+///
+/// The trailer is `OMASSISTANT-HTTP <code> <redirect_url>` on its own last line, so
+/// a page that happens to end in that text still opens; only a trailer that parses
+/// as a status code is taken as one.
+#[must_use]
+pub fn strip_http_trailer(raw: &str) -> (String, u16, String) {
+    const MARKER: &str = "OMASSISTANT-HTTP ";
+    let Some(index) = raw.rfind(MARKER) else {
+        return (raw.to_string(), 0, String::new());
+    };
+    // Must be at the start of a line, and the tail must look like "<code> <url>".
+    if index > 0 && !raw[..index].ends_with('\n') {
+        return (raw.to_string(), 0, String::new());
+    }
+    let tail = &raw[index + MARKER.len()..];
+    let tail = tail.trim_end_matches('\n');
+    let (code, redirect) = tail.split_once(' ').unwrap_or((tail, ""));
+    let Ok(code) = code.trim().parse::<u16>() else {
+        return (raw.to_string(), 0, String::new());
+    };
+    let body = raw[..index].trim_end_matches('\n').to_string();
+    (body, code, redirect.trim().to_string())
+}
+
 /// Turn a page into something a model can read: no scripts, no styles, no tags.
 ///
 /// Entities are decoded *first*: a feed writes its description as `&lt;p&gt;` when
@@ -1084,5 +1109,23 @@ mod tests {
         assert!(!text.contains("var x"), "{text}");
         assert!(!text.contains("hidden"), "{text}");
         assert!(!text.contains('<'), "{text}");
+    }
+    #[test]
+    fn a_status_trailer_is_split_off_a_page() {
+        let (body, code, redirect) =
+            strip_http_trailer("hello\nOMASSISTANT-HTTP 301 http://127.0.0.1/x\n");
+        assert_eq!(body, "hello");
+        assert_eq!(code, 301);
+        assert_eq!(redirect, "http://127.0.0.1/x");
+
+        let (body, code, _) = strip_http_trailer("<p>ok</p>\nOMASSISTANT-HTTP 200 ");
+        assert_eq!(body, "<p>ok</p>");
+        assert_eq!(code, 200);
+
+        // A page that merely mentions the words is not a trailer.
+        let raw = "see OMASSISTANT-HTTP 200 in the docs";
+        let (body, code, _) = strip_http_trailer(raw);
+        assert_eq!(body, raw);
+        assert_eq!(code, 0);
     }
 }

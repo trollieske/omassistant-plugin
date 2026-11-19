@@ -178,7 +178,16 @@ Item {
   readonly property int cornerRadius: Style.cornerRadius
   readonly property int contentMargin: Style.spacing.panelPadding
   readonly property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
-  readonly property int composerHeight: Math.max(Style.space(40), Style.font.heading + Style.spacing.inputPaddingY * 2)
+  // A confirmation that names a whole command needs the room to show it: the row
+  // grows to the text instead of eliding what is being approved.
+  readonly property int brokerSummaryLines: {
+    if (!root.brokerConfirm) return 1
+    var chars = String(root.brokerSummary || "").length
+    return Math.max(1, Math.min(5, Math.ceil(chars / 68)))
+  }
+  readonly property int composerHeight: root.brokerConfirm
+    ? Style.space(10) + root.brokerSummaryLines * (Style.font.body + Style.space(5))
+    : Math.max(Style.space(40), Style.font.heading + Style.spacing.inputPaddingY * 2)
   readonly property int footerHeight: Math.max(Style.space(20), Style.font.caption + Style.spacing.md)
   readonly property int sectionGap: Style.spacing.xxl
   readonly property int messageGap: Style.space(7)
@@ -1577,9 +1586,14 @@ Item {
             anchors.rightMargin: Style.space(12)
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
+            // The whole operation, wrapped. An ellipsis here would mean approving
+            // characters nobody saw, which is exactly what the review called out;
+            // the broker caps every operation at what these lines can hold.
             text: root.brokerSummary
             color: root.accent
-            elide: Text.ElideRight
+            wrapMode: Text.Wrap
+            maximumLineCount: 5
+            elide: Text.ElideNone
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: true
@@ -1587,6 +1601,7 @@ Item {
 
           Text {
             id: brokerKeys
+            visible: root.brokerSummaryLines === 1
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText

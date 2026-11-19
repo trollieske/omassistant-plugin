@@ -50,7 +50,14 @@ use std::time::Duration;
 
 /// The most characters `act.type` will type in one call. Characters, not bytes: a pasted document
 /// is refused by how long it is to read, not by how wide its encoding happens to be.
-pub const MAX_TYPE_CHARS: usize = 4_000;
+/// The most text one `act.type` call may type.
+///
+/// The limit is what the consent row can show *in full*. A research review found
+/// the old behaviour: the card showed the first eighty characters and approved the
+/// other four thousand. An approval that cannot be read is not an approval, so the
+/// operation is capped at what the card renders, and a longer text is refused with
+/// the reason (split it, or use the clipboard — a paste is one visible step).
+pub const MAX_TYPE_CHARS: usize = 300;
 /// The most characters `act.clipboard write` will put on the clipboard.
 pub const MAX_CLIPBOARD_CHARS: usize = 100_000;
 /// The launch verbs Omarchy has a launcher for. Each maps to one program; there are no arguments a
@@ -77,7 +84,10 @@ pub const DEFAULT_EXEC_SECONDS: u64 = 60;
 /// The longest a `shell.exec` command may run.
 pub const MAX_EXEC_SECONDS: u64 = 300;
 /// The most characters a `shell.exec` command may have.
-pub const MAX_COMMAND_CHARS: usize = 4_000;
+/// The most characters one `shell.exec` command may have, for the same reason as
+/// [`MAX_TYPE_CHARS`]: the card shows the command, and a command it cannot show in
+/// full is not run.
+pub const MAX_COMMAND_CHARS: usize = 300;
 /// The most output kept from one `shell.exec` stream.
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// Programs that would ask for a password or a root shell. The daemon never
@@ -625,6 +635,12 @@ impl Actor {
     }
 
     /// Read one public page as text. Capability `web.search`.    /// Read one public page as text. Capability `web.search`.
+    ///
+    /// Redirects are not followed. The host check happens before the request, so a
+    /// public address that answers `301 Location: http://127.0.0.1:8080/` would
+    /// otherwise hand the model this machine's own services through a hole the
+    /// check cannot see. The redirect is reported instead, and the person's next
+    /// request runs the check again on the new address.
     pub fn fetch_url(&self, url: &str) -> Result<String, ApiError> {
         let max_bytes = crate::web::MAX_BODY_BYTES.to_string();
         let output = self.runner.run(
@@ -634,7 +650,10 @@ impl Actor {
                 "--silent",
                 "--show-error",
                 "--fail",
-                "--location",
+                "--max-redirs",
+                "0",
+                "--write-out",
+                "\nOMASSISTANT-HTTP %{http_code} %{redirect_url}",
                 "--connect-timeout",
                 "5",
                 "--max-time",
@@ -659,9 +678,15 @@ impl Actor {
                 ),
             ));
         }
-        Ok(crate::web::html_to_text(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
+        let body = String::from_utf8_lossy(&output.stdout).into_owned();
+        let (body, code, redirect) = crate::web::strip_http_trailer(&body);
+        if (300..400).contains(&code) && !redirect.is_empty() {
+            return Err(ApiError::invalid(format!(
+                "that address redirects to {redirect}, which was not opened; ask for that address \
+                 directly and it will be checked on its own"
+            )));
+        }
+        Ok(crate::web::html_to_text(&body))
     }
 
     /// Run one command line in the person's own shell, and return its output.
@@ -1181,7 +1206,10 @@ pub fn validate_command(raw: &str) -> Result<String, ApiError> {
     if command.chars().count() > MAX_COMMAND_CHARS {
         return Err(ApiError::new(
             ErrorCode::TooLarge,
-            format!("a command may not be longer than {MAX_COMMAND_CHARS} characters"),
+            format!(
+                "a command may not be longer than {MAX_COMMAND_CHARS} characters, because the card \
+                 shows the whole command before you approve it; split it into steps"
+            ),
         ));
     }
     if command.chars().any(|ch| ch.is_control()) {
@@ -1286,8 +1314,8 @@ pub fn validate_text(text: &str) -> Result<usize, ApiError> {
         return Err(ApiError::new(
             ErrorCode::TooLarge,
             format!(
-                "the text is {chars} characters, over the {MAX_TYPE_CHARS} this daemon will type \
-                 in one call"
+                "the text is {chars} characters, over the {MAX_TYPE_CHARS} the card can show in \
+                 full; type it in smaller pieces, or put it on the clipboard and paste once"
             ),
         ));
     }
@@ -1596,6 +1624,8 @@ mod tests {
         clients: Mutex<Vec<u8>>,
         /// What `hyprctl -j activeworkspace` answers.
         workspace: Mutex<Vec<u8>>,
+        /// What `curl` answers, trailer included.
+        curl: Mutex<Vec<u8>>,
     }
 
     impl Recorder {
@@ -1665,8 +1695,13 @@ mod tests {
             });
         }
 
+        fn set_curl(&self, body: &[u8]) {
+            *self.curl.lock().unwrap() = body.to_vec();
+        }
+
         fn answer(&self, program: &str, args: &[&str]) -> CommandOutput {
             match program {
+                "curl" => ok(self.curl.lock().unwrap().clone()),
                 "hyprctl" if args == ["cursorpos"] => {
                     ok(self.cursor.lock().unwrap().clone().into_bytes())
                 }
@@ -1938,7 +1973,10 @@ mod tests {
     fn text_validation_counts_characters_and_refuses_hostile_ones() {
         assert_eq!(validate_text("hello").unwrap(), 5);
         assert_eq!(validate_text("two\nlines\tand a tab").unwrap(), 19);
-        assert_eq!(validate_text(&"é".repeat(MAX_TYPE_CHARS)).unwrap(), 4000);
+        assert_eq!(
+            validate_text(&"é".repeat(MAX_TYPE_CHARS)).unwrap(),
+            MAX_TYPE_CHARS
+        );
 
         let err = validate_text("").unwrap_err();
         assert_eq!(err.code(), ErrorCode::NothingToType);
@@ -1951,13 +1989,51 @@ mod tests {
             assert!(err.message().contains("U+"), "{}", err.message());
         }
 
-        // One character over the cap, and the byte/char distinction: 4001 multi-byte characters are
-        // 8002 bytes, and still refused for their 4001 characters.
+        // One character over the cap, and the byte/char distinction: multi-byte
+        // characters are many more bytes but are counted as characters.
+        let over = (MAX_TYPE_CHARS + 1).to_string();
         let err = validate_text(&"x".repeat(MAX_TYPE_CHARS + 1)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::TooLarge);
-        assert!(err.message().contains("4001"), "{}", err.message());
+        assert!(err.message().contains(&over), "{}", err.message());
         let err = validate_text(&"é".repeat(MAX_TYPE_CHARS + 1)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::TooLarge);
+    }
+
+    #[test]
+    fn a_fetch_reports_a_redirect_instead_of_following_it() {
+        // The destination check runs on the requested URL, so a redirect must not
+        // be followed: it is how a public page would reach this machine's own
+        // services past the check.
+        let recorder = Arc::new(Recorder::new());
+        recorder.set_curl(b"<p>moved</p>\nOMASSISTANT-HTTP 301 http://127.0.0.1:8080/admin\n");
+        let error = actor(&recorder)
+            .fetch_url("https://example.com/x")
+            .unwrap_err();
+        assert_eq!(error.code(), ErrorCode::InvalidParams);
+        assert!(
+            error
+                .message()
+                .contains("redirects to http://127.0.0.1:8080/admin"),
+            "{}",
+            error.message()
+        );
+        // And curl was told not to follow: the flag is the guard, not the parse.
+        let calls = recorder.calls();
+        let curl = calls.iter().find(|call| call.program == "curl").unwrap();
+        assert!(
+            curl.args
+                .windows(2)
+                .any(|pair| pair == ["--max-redirs", "0"]),
+            "{:?}",
+            curl.args
+        );
+
+        // A normal page comes back as text, trailer stripped.
+        recorder
+            .set_curl(b"<html><body><p>hi <b>there</b></p></body></html>\nOMASSISTANT-HTTP 200 \n");
+        let text = actor(&recorder).fetch_url("https://example.com/x").unwrap();
+        assert_eq!(text, "hi there");
+        assert!(!text.contains("OMASSISTANT"), "{text}");
     }
 
     #[test]

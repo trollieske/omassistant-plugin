@@ -49,6 +49,14 @@ created `0600` (`the_state_tree_and_the_socket_are_private`).
 
 ## Invariants
 
+**0. An approval shows exactly what runs.** Every consent string is the whole
+operation: the command `shell.exec` will run, and the text `act.type` will type. Both
+are capped at what the card can display in full (300 characters) and a longer
+operation is refused *before* a confirmation is asked for, with the reason. There is
+no truncation between "what you approved" and "what happened".
+Tests: `the_command_in_the_confirmation_is_the_command_that_runs`,
+`act_type_refuses_bad_text_before_anything_is_typed`.
+
 **1. The model's only tools are the broker's.** `pi` is started with
 `--no-extensions --no-skills --no-prompt-templates --no-context-files -e builtin:mcp
 --tools mcp__omassistant__* --no-builtin-tools` (`Omassistant.qml`, `baseArgv()`). Without
@@ -84,7 +92,11 @@ before anything runs, and says why (`one_command_runs_in_the_persons_shell`). No
 escalates; the package installs user-level binaries only.
 
 **6. Network egress is a capability, not a side effect.** `web.search` and `web.fetch` are consented
-like everything else. URLs must be `http`/`https` and the host must be public: `localhost`, `127/8`,
+like everything else. Redirects are **not** followed: the host check runs before the request, and a
+public address that answers `301` to a private one would otherwise reach this machine's own services
+past it. The redirect is reported instead, and asking for the new address runs the check again
+(`a_fetch_reports_a_redirect_instead_of_following_it`). URLs must be `http`/`https` and the host must
+be public: `localhost`, `127/8`,
 `::1`, RFC 1918, link-local, `.local`, `.internal` and a URL with credentials are refused by name, and
 a name that resolves into a private range is refused after resolution
 (`only_public_http_urls_are_fetched`). The audit records the host and the length, never the query.
