@@ -59,7 +59,12 @@ use std::time::Duration;
 /// the reason (split it, or use the clipboard — a paste is one visible step).
 pub const MAX_TYPE_CHARS: usize = 300;
 /// The most characters `act.clipboard write` will put on the clipboard.
-pub const MAX_CLIPBOARD_CHARS: usize = 100_000;
+/// The most text one clipboard *write* may carry, for the same reason as
+/// [`MAX_TYPE_CHARS`]: the card shows the text before the person approves it, and a
+/// paste of unknown content is not an approval. Reading is bounded separately
+/// ([`MAX_CLIPBOARD_BYTES`]) — a read is not an operation the person approves the
+/// content of.
+pub const MAX_CLIPBOARD_CHARS: usize = 300;
 /// The launch verbs Omarchy has a launcher for. Each maps to one program; there are no arguments a
 /// caller can add, no paths, no shell. `omarchy-launch-*` already follows
 /// `omarchy default browser|terminal|editor`, so the app is the person's choice made in Omarchy.
@@ -2092,7 +2097,7 @@ mod tests {
         assert_eq!(validate_clipboard_text("").unwrap(), 0);
         assert_eq!(
             validate_clipboard_text(&"é".repeat(MAX_CLIPBOARD_CHARS)).unwrap(),
-            100_000
+            MAX_CLIPBOARD_CHARS
         );
         let err = validate_clipboard_text(&"x".repeat(MAX_CLIPBOARD_CHARS + 1)).unwrap_err();
         assert_eq!(err.code(), ErrorCode::TooLarge);

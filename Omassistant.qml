@@ -404,6 +404,8 @@ Item {
       messages: transcriptModel.count,
       session: runtime.currentSessionFile,
       memory: root.memory,
+      tabs: root.tabLabels(),
+      activeTab: root.activeTabId,
       sessions: root.sessions.length,
       look: root.lookState,
       acting: root.actionState,

@@ -53,13 +53,18 @@ created `0600` (`the_state_tree_and_the_socket_are_private`).
 operation: the *script* `shell.exec` will run — built by one function
 (`act::command_script`) that both the summary and the executor call, so they cannot
 drift — plus the text `act.type` will type, the program and arguments a `shell.run`
-action starts, the desktop id `act.launch` hands to `gtk-launch`, and the whole URL
-`web.fetch` will open, path and query included (the audit keeps the host alone).
+action starts, the desktop id `act.launch` hands to `gtk-launch`, the whole text an
+`act.clipboard` write puts on the clipboard, the whole query `web.search` sends, and
+the whole URL `web.fetch` will open, path and query included (the audit keeps the
+host alone).
 `shell.exec` runs `bash --noprofile --norc -c <that script>`: a login shell would
 run `~/.profile`, `~/.bash_profile` and `/etc/profile` first, which is code nobody
 approved. Operations are capped at what the card can display in full — 300
-characters for a command, a typed text and a URL — and anything longer is refused
-*before* a confirmation is asked for, with the reason. There is no truncation
+characters for a command, a typed text and a clipboard write, 300 for a URL, and a
+search query at its own 200 — and anything longer is refused *before* a
+confirmation is asked for, with the reason. Reading the clipboard is bounded
+separately (100 000 bytes): the content of a read is the result, not an operation
+the person approves the content of. There is no truncation
 between "what you approved" and "what happened".
 
 **1. The model's only tools are the broker's.** `pi` is started with

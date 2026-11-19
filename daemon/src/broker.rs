@@ -30,6 +30,22 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 /// What a method needs from the outside world, injected so tests need no compositor.
+/// What an `act.type` confirmation says: the text, in full. A preview left the tail
+/// of a paragraph authorised but unseen, which is the finding this closes.
+fn type_summary(class: &str, text: &str) -> String {
+    format!("Type into {class}: \"{text}\"")
+}
+
+/// What an `act.clipboard` write says: the text, in full.
+fn clipboard_summary(text: &str) -> String {
+    format!("Copy to the clipboard: \"{text}\"")
+}
+
+/// What a `web.search` confirmation says: the query, in full.
+fn search_summary(query: &str) -> String {
+    format!("Search the web for: {query}")
+}
+
 /// What a `shell.run` confirmation says: the label the person recognises *and* the
 /// program with its arguments, because a label is a wish and the program is the
 /// operation.
@@ -502,7 +518,7 @@ impl Broker {
             known = Some(self.focused_window(trace)?);
         }
         let summary = match &known {
-            Some(target) => format!("Type into {}: \"{}\"", target.class, preview(text, 80)),
+            Some(target) => type_summary(&target.class, text),
             None => String::new(),
         };
         let now_unix = now.unix_timestamp();
@@ -903,7 +919,7 @@ impl Broker {
         trace.action = Some("search".to_string());
         trace.chars = Some(query.chars().count() as u64);
 
-        let summary = format!("Search the web for: {}", one_line(&query, 120));
+        let summary = search_summary(&query);
         let now_unix = now.unix_timestamp();
         let grant = self.require_grant_interactive(
             &caps::WEB_SEARCH,
@@ -1148,10 +1164,7 @@ impl Broker {
         let now_unix = now.unix_timestamp();
         let summary = match mode {
             ClipboardMode::Read => "Read the clipboard".to_string(),
-            ClipboardMode::Write => format!(
-                "Copy to the clipboard: \"{}\"",
-                preview(text.unwrap_or_default(), 80)
-            ),
+            ClipboardMode::Write => clipboard_summary(text.unwrap_or_default()),
         };
         let grant = self.require_grant_interactive(
             &caps::ACT_CLIPBOARD,
@@ -1852,18 +1865,6 @@ fn focus_moved(message: &str) -> ApiError {
     ApiError::new(ErrorCode::FocusMoved, message)
 }
 
-/// A one-line, length-capped preview for a confirmation summary.
-fn preview(text: &str, limit: usize) -> String {
-    let one = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one.chars().count() <= limit {
-        one
-    } else {
-        let mut short: String = one.chars().take(limit.saturating_sub(1)).collect();
-        short.push('…');
-        short
-    }
-}
-
 fn required_fraction(params: &Map<String, Value>, field: &str) -> Result<f64, ApiError> {
     let value = params.get(field).and_then(Value::as_f64).ok_or_else(|| {
         ApiError::invalid(format!(
@@ -2113,6 +2114,30 @@ mod tests {
         let fetch = fetch_summary("https://example.com/a/b?c=1#d");
         assert!(fetch.contains("/a/b?c=1#d"), "{fetch}");
         assert_eq!(fetch, "Read: https://example.com/a/b?c=1#d");
+    }
+
+    #[test]
+    fn no_summary_hides_the_end_of_its_operation() {
+        // Every capability at its own limit: the summary has to contain all of it.
+        let typing = "x".repeat(crate::act::MAX_TYPE_CHARS);
+        assert!(type_summary("foot", &typing).contains(&typing));
+        let clip = "y".repeat(crate::act::MAX_CLIPBOARD_CHARS);
+        assert!(clipboard_summary(&clip).contains(&clip));
+        let query = "q".repeat(crate::web::MAX_QUERY_CHARS);
+        assert!(search_summary(&query).contains(&query));
+        // And the display cap is what bounds them, so every one fits the row. (Kept
+        // as values, not const assertions, so the reason lives next to the test.)
+        let limits = [
+            crate::act::MAX_TYPE_CHARS,
+            crate::act::MAX_CLIPBOARD_CHARS,
+            crate::web::MAX_QUERY_CHARS,
+        ];
+        for limit in limits {
+            assert!(
+                limit <= crate::web::MAX_SHOWN_URL_CHARS,
+                "{limit} does not fit"
+            );
+        }
     }
 
     #[test]
