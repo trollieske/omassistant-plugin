@@ -31,6 +31,9 @@ use std::net::IpAddr;
 pub const MAX_QUERY_CHARS: usize = 200;
 /// The longest URL this daemon will fetch.
 pub const MAX_URL_CHARS: usize = 2000;
+/// The longest URL the card will show in full, and therefore the longest one it
+/// will fetch.
+pub const MAX_SHOWN_URL_CHARS: usize = 300;
 /// The most text returned from one page.
 pub const MAX_TEXT_CHARS: usize = 20_000;
 /// The most bytes read from one page. A Wikipedia article is over a megabyte

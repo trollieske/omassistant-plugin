@@ -195,6 +195,12 @@ Item {
   // What the person asked before, newest last. Up in an empty composer walks it
   // back, the way a shell does.
   property var questionHistory: []
+  // --- tabs ---------------------------------------------------------------
+  // A tab is one conversation: a pi session file once it has a first message.
+  // They are persisted so a restart lands where the person was.
+  property var tabs: []
+  property string activeTabId: ""
+  property int tabSerial: 1
   property bool companionCollapsed: false
   property bool uiLoaded: false
 
@@ -439,6 +445,138 @@ Item {
   }
 
   // --- conversation ------------------------------------------------------
+
+  function tabById(id) {
+    for (var i = 0; i < root.tabs.length; i++) {
+      if (String(root.tabs[i].id) === String(id)) return root.tabs[i]
+    }
+    return null
+  }
+
+  function tabTitle(tab) {
+    if (!tab) return ""
+    if (String(tab.title || "").length) return String(tab.title)
+    // A conversation that has been used is named by its session, so the tab and
+    // the history list never disagree.
+    for (var i = 0; i < root.sessions.length; i++) {
+      var entry = root.sessions[i]
+      if (String(entry.file) === String(tab.file) && String(entry.title || "").length)
+        return String(entry.title)
+    }
+    return "New conversation"
+  }
+
+  function tabLabels() {
+    var out = []
+    for (var i = 0; i < root.tabs.length; i++) {
+      var tab = root.tabs[i]
+      out.push({ id: String(tab.id), title: root.tabTitle(tab), active: String(tab.id) === root.activeTabId,
+        file: String(tab.file || "") })
+    }
+    return out
+  }
+
+  function saveTabs() {
+    var kept = []
+    for (var i = 0; i < root.tabs.length; i++) {
+      kept.push({ id: String(root.tabs[i].id), file: String(root.tabs[i].file || ""),
+        title: String(root.tabs[i].title || "") })
+    }
+    root.tabs = kept
+    root.saveUi()
+  }
+
+  function setActiveTabFile(file) {
+    var tab = root.tabById(root.activeTabId)
+    if (!tab || !String(file || "").length) return
+    if (String(tab.file) === String(file)) return
+    tab.file = String(file)
+    root.saveTabs()
+  }
+
+  function newTab() {
+    root.setActiveTabFile(runtime.currentSessionFile)
+    root.tabSerial += 1
+    var tab = { id: "tab" + root.tabSerial + "-" + Date.now(), file: "", title: "" }
+    root.tabs = root.tabs.concat([tab])
+    root.activeTabId = tab.id
+    root.saveTabs()
+    root.clearConversation()
+  }
+
+  function switchTab(id) {
+    if (String(id) === root.activeTabId) return
+    var tab = root.tabById(id)
+    if (!tab) return
+    root.setActiveTabFile(runtime.currentSessionFile)
+    root.activeTabId = String(id)
+    root.saveTabs()
+    if (String(tab.file || "").length) root.resumeSession(String(tab.file))
+    else root.clearConversation()
+  }
+
+  function closeTab(id) {
+    if (root.tabs.length <= 1) return
+    var index = -1
+    for (var i = 0; i < root.tabs.length; i++) if (String(root.tabs[i].id) === String(id)) index = i
+    if (index < 0) return
+    var wasActive = String(id) === root.activeTabId
+    var kept = root.tabs.slice(0, index).concat(root.tabs.slice(index + 1))
+    root.tabs = kept
+    if (wasActive) {
+      var next = kept[Math.min(index, kept.length - 1)]
+      root.activeTabId = String(next.id)
+      root.saveTabs()
+      if (String(next.file || "").length) root.resumeSession(String(next.file))
+      else root.clearConversation()
+    } else {
+      root.saveTabs()
+    }
+  }
+
+  function cycleTab(delta) {
+    if (root.tabs.length < 2) return
+    var index = 0
+    for (var i = 0; i < root.tabs.length; i++) if (String(root.tabs[i].id) === root.activeTabId) index = i
+    var next = (index + delta + root.tabs.length) % root.tabs.length
+    root.switchTab(String(root.tabs[next].id))
+  }
+
+  function renameTab(id, title) {
+    var tab = root.tabById(id)
+    if (!tab) return
+    tab.title = String(title || "").replace(/\s+/g, " ").slice(0, 60)
+    root.saveTabs()
+    // The history list is the same conversation: keep the names in step.
+    var file = String(tab.file || "")
+    if (file.length && tab.title.length) {
+      var list = root.sessions.slice()
+      var changed = false
+      for (var i = 0; i < list.length; i++) {
+        if (String(list[i].file) === file) {
+          list[i] = Object.assign({}, list[i], { title: tab.title })
+          changed = true
+        }
+      }
+      if (changed) {
+        root.sessions = list
+        root.rebuildSessionModel()
+        root.saveIndex()
+      }
+    }
+    root.publishState()
+  }
+
+  function ensureTabs() {
+    if (root.tabs.length) {
+      if (!root.tabById(root.activeTabId)) root.activeTabId = String(root.tabs[0].id)
+      return
+    }
+    root.tabSerial += 1
+    var tab = { id: "tab" + root.tabSerial, file: "", title: "" }
+    root.tabs = [tab]
+    root.activeTabId = tab.id
+  }
 
   function submit(text, image) {
     var raw = String(text || "").trim()
@@ -1074,6 +1212,20 @@ Item {
     try { data = JSON.parse(String(raw || "{}")) } catch (error) { data = null }
     if (data && typeof data === "object" && typeof data.companionCollapsed === "boolean")
       root.companionCollapsed = data.companionCollapsed
+    if (data && typeof data === "object" && data.tabs instanceof Array) {
+      var restored = []
+      for (var j = 0; j < data.tabs.length && restored.length < 12; j++) {
+        var raw = data.tabs[j]
+        if (!raw || typeof raw !== "object") continue
+        restored.push({ id: String(raw.id || ("tab" + j)), file: String(raw.file || ""),
+          title: String(raw.title || "") })
+      }
+      if (restored.length) {
+        root.tabs = restored
+        root.activeTabId = String(data.activeTabId || restored[0].id)
+        root.tabSerial = Number(data.tabSerial || restored.length)
+      }
+    }
     if (data && typeof data === "object" && data.questionHistory instanceof Array) {
       var kept = []
       for (var i = 0; i < data.questionHistory.length; i++) {
@@ -1089,7 +1241,10 @@ Item {
     if (!root.workspaceReady) return
     uiView.setText(JSON.stringify({
       companionCollapsed: root.companionCollapsed,
-      questionHistory: root.questionHistory
+      questionHistory: root.questionHistory,
+      tabs: root.tabs,
+      activeTabId: root.activeTabId,
+      tabSerial: root.tabSerial
     }) + "\n")
   }
 
@@ -3257,6 +3412,9 @@ Item {
   }
 
   function onSessionReady(file, id, count) {
+    // The tab follows the session: a new tab has no file until its first message.
+    root.ensureTabs()
+    root.setActiveTabFile(file)
     root.publishState()
     if (runtime.live) runtime.requestModels()
     if (!root.memory) {
@@ -3970,6 +4128,7 @@ Item {
 
   Component.onCompleted: {
     root.ensureDirs()
+    root.ensureTabs()
     root.refreshWebSearch()
     // The agent's tools need the broker; it lives as a child of the shell.
     Qt.callLater(function() { root.ensureDaemon() })
@@ -4013,6 +4172,8 @@ Item {
       previewCaption: root.previewCaption
       mediaImages: root.mediaImages
       runSteps: root.runSteps
+      tabLabels: root.tabLabels()
+      activeTabId: root.activeTabId
       runClicks: root.runClicks
       brokerActing: root.brokerGrantActive
       grantsOn: root.grantedCount > 0
@@ -4043,6 +4204,11 @@ Item {
       onSettingsLocalOnlyChanged: function(on) { root.setLocalOnlyChoice(on) }
       onSettingsDiscover: root.startLocalDiscovery()
       onActingFocusRelease: root.releaseActingFocus()
+      onTabChosen: function(id) { root.switchTab(id) }
+      onTabNew: root.newTab()
+      onTabClosed: function(id) { root.closeTab(id) }
+      onTabRenamed: function(id, title) { root.renameTab(id, title) }
+      onTabCycled: function(delta) { root.cycleTab(delta) }
       onPreviewRequested: root.requestScreenPreview()
       onSettingsRefresh: {
         root.refreshModelCatalog()

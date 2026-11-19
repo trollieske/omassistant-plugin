@@ -30,6 +30,26 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 /// What a method needs from the outside world, injected so tests need no compositor.
+/// What a `shell.run` confirmation says: the label the person recognises *and* the
+/// program with its arguments, because a label is a wish and the program is the
+/// operation.
+fn shell_run_summary(action: &str) -> Result<String, ApiError> {
+    let (program, args) = crate::act::shell_action_program(action)
+        .ok_or_else(|| ApiError::internal(format!("the action {action} has no program")))?;
+    Ok(format!(
+        "{}: {}",
+        crate::act::shell_action_label(action),
+        crate::act::program_line(program, args)
+    ))
+}
+
+/// What a `web.fetch` confirmation says: the whole address. The path and the query
+/// are what is fetched; an approval that omitted them would authorise an unknown
+/// page. The audit still keeps only the host.
+fn fetch_summary(url: &str) -> String {
+    format!("Read: {url}")
+}
+
 /// How much of a consent summary is kept. Every operation is capped at what the
 /// card can show (see `MAX_TYPE_CHARS` and `MAX_COMMAND_CHARS` in `act`), so this is
 /// room for the sentence around it, not a place where content is cut off.
@@ -704,7 +724,14 @@ impl Broker {
                     )));
                 }
                 trace.action = Some(id.clone());
-                let summary = format!("Open {}", crate::launch::display_name(&id));
+                // The id is what `gtk-launch` receives; the name is only what the
+                // menu calls it. Show both when they differ.
+                let name = crate::launch::display_name(&id);
+                let summary = if name == id {
+                    format!("Open {id}")
+                } else {
+                    format!("Open {name} ({id})")
+                };
                 (None, LaunchApp::Desktop(id), summary)
             }
             None => {
@@ -715,8 +742,21 @@ impl Broker {
                 // before consent is asked: the confirmation should name the app that opens.
                 let app = self.launch_app(action)?;
                 let summary = match &app {
-                    LaunchApp::Command => format!("Open the {action}"),
-                    LaunchApp::Desktop(id) => format!("Open {}", crate::launch::display_name(id)),
+                    LaunchApp::Command => match crate::act::launch_verb_program(action) {
+                        Some((program, args)) => format!(
+                            "Open the {action}: {}",
+                            crate::act::program_line(program, args)
+                        ),
+                        None => format!("Open the {action}"),
+                    },
+                    LaunchApp::Desktop(id) => {
+                        let name = crate::launch::display_name(id);
+                        if name == *id {
+                            format!("Open {id}")
+                        } else {
+                            format!("Open {name} ({id})")
+                        }
+                    }
                 };
                 (Some(action), app, summary)
             }
@@ -972,6 +1012,18 @@ impl Broker {
     ) -> Result<Value, ApiError> {
         let url = required_text(params, "web.fetch", "url")?;
         let url = crate::web::validate_url(url)?;
+        // Same rule as a command: if the card cannot show it whole, it is not
+        // approved at all.
+        if url.chars().count() > crate::web::MAX_SHOWN_URL_CHARS {
+            return Err(ApiError::new(
+                ErrorCode::TooLarge,
+                format!(
+                    "a URL may not be longer than {} characters, because the card shows the whole \
+                     address before you approve it",
+                    crate::web::MAX_SHOWN_URL_CHARS
+                ),
+            ));
+        }
         // Host only: a path or a query string can name a person or carry a token.
         let host = url
             .split_once("://")
@@ -981,7 +1033,7 @@ impl Broker {
         trace.action = Some(host.clone());
         trace.chars = Some(url.chars().count() as u64);
 
-        let summary = format!("Read this page: {host}");
+        let summary = fetch_summary(&url);
         let now_unix = now.unix_timestamp();
         let grant = self.require_grant_interactive(
             &caps::WEB_SEARCH,
@@ -1022,12 +1074,13 @@ impl Broker {
         let action = crate::act::shell_action(action)?;
         trace.action = Some(action.to_string());
 
+        let summary = shell_run_summary(action)?;
         let now_unix = now.unix_timestamp();
         let grant = self.require_grant_interactive(
             &caps::SHELL_RUN,
             "one action",
             wants_confirmation(params),
-            crate::act::shell_action_label(action).to_string(),
+            summary,
             "shell.run",
             None,
             AllowPolicy::Once,
@@ -2046,6 +2099,20 @@ mod tests {
             .filter(|cap| !cap["grant"].is_null())
             .count();
         assert_eq!(granted, 0, "trust off left grants behind");
+    }
+
+    #[test]
+    fn a_confirmation_names_the_operation_not_just_a_label() {
+        // The review called this out three times: the card has to show what runs.
+        let run = shell_run_summary("volume-up").unwrap();
+        assert!(run.contains("omarchy-audio-output-volume"), "{run}");
+        assert!(run.contains("raise"), "{run}");
+        let lock = shell_run_summary("lock").unwrap();
+        assert!(lock.contains("omarchy-system-lock"), "{lock}");
+
+        let fetch = fetch_summary("https://example.com/a/b?c=1#d");
+        assert!(fetch.contains("/a/b?c=1#d"), "{fetch}");
+        assert_eq!(fetch, "Read: https://example.com/a/b?c=1#d");
     }
 
     #[test]

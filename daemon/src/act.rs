@@ -195,6 +195,38 @@ pub const SHELL_ACTIONS: &[(&str, &[&str])] = &[
 ];
 
 /// A human sentence for the confirmation and the model.
+/// The program and arguments a fixed desktop action runs.
+///
+/// The confirmation names them: "Lock the screen" is a wish, `omarchy-system-lock`
+/// is the operation, and an approval should be about the operation.
+#[must_use]
+pub fn shell_action_program(name: &str) -> Option<(&'static str, &'static [&'static str])> {
+    SHELL_ACTIONS
+        .iter()
+        .find(|(action, _)| *action == name)
+        .map(|(_, argv)| (argv[0], &argv[1..]))
+}
+
+/// The program a launch verb runs.
+#[must_use]
+pub fn launch_verb_program(verb: &str) -> Option<(&'static str, &'static [&'static str])> {
+    LAUNCH_ACTIONS
+        .iter()
+        .find(|(action, _)| *action == verb)
+        .map(|(_, argv)| (argv[0], &argv[1..]))
+}
+
+/// One program and its arguments, as a line a person can read.
+#[must_use]
+pub fn program_line(program: &str, args: &[&str]) -> String {
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        line.push_str(arg);
+    }
+    line
+}
+
 pub fn shell_action_label(name: &str) -> &'static str {
     match name {
         "lock" => "Lock the screen",

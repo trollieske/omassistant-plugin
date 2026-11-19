@@ -89,6 +89,10 @@ Item {
   // What the run is doing, from the broker's audit: the steps are real, and the
   // click count is the proof that most of them were not clicks.
   property var runSteps: []
+  // Conversations as tabs: a label list, the active one, and rename in place.
+  property var tabLabels: []
+  property string activeTabId: ""
+  property string renamingTabId: ""
   property int runClicks: 0
   property int recallIndex: -1
   property string recallDraft: ""
@@ -139,6 +143,11 @@ Item {
   // A click on the card is a request for the keyboard, even while an action has
   // it: the card must never be a window with no way back in.
   signal actingFocusRelease()
+  signal tabChosen(string id)
+  signal tabNew()
+  signal tabClosed(string id)
+  signal tabRenamed(string id, string title)
+  signal tabCycled(int delta)
   signal previewRequested()
   signal settingsWebKeySaved(string key)
   signal settingsTrustChanged(bool on)
@@ -684,9 +693,127 @@ Item {
         }
       }
 
+      // Conversations, side by side. A tab is a session: switching loads its
+      // transcript, renaming renames it in the history list too. Double-click a
+      // tab to rename it; the × closes it and the + opens a new one.
       Item {
-        id: body
-        anchors.top: header.bottom
+        id: tabStrip
+          anchors.top: header.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: root.tabLabels.length > 1 ? Style.space(26) : 0
+          visible: height > 0
+          clip: true
+
+          Row {
+            anchors.fill: parent
+            spacing: Style.space(6)
+
+            Repeater {
+              model: root.tabLabels
+              delegate: Item {
+                required property var modelData
+                width: Math.min(Style.space(150), tabRow.implicitWidth + Style.space(16))
+                height: tabStrip.height
+                readonly property bool isActive: modelData.active
+
+                Rectangle {
+                  anchors.fill: parent
+                  anchors.topMargin: Style.space(2)
+                  anchors.bottomMargin: Style.space(4)
+                  radius: Style.space(3)
+                  color: tabMouse.containsMouse && !parent.isActive
+                    ? Commons.Util.alpha(root.foreground, 0.06)
+                    : (parent.isActive ? Commons.Util.alpha(root.accent, 0.14) : "transparent")
+                }
+
+                Row {
+                  id: tabRow
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.space(8)
+                  spacing: Style.space(6)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: root.renamingTabId === modelData.id ? "" : modelData.title
+                    visible: root.renamingTabId !== modelData.id
+                    color: parent.parent.isActive ? root.accent : root.textSecondary
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: parent.parent.isActive
+                    elide: Text.ElideRight
+                    width: Math.min(implicitWidth, Style.space(112))
+                  }
+
+                  TextInput {
+                    visible: root.renamingTabId === modelData.id
+                    width: Math.min(Style.space(112), implicitWidth)
+                    text: modelData.title
+                    color: root.accent
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    selectByMouse: true
+                    focus: visible
+                    onAccepted: {
+                      root.tabRenamed(modelData.id, text)
+                      root.renamingTabId = ""
+                    }
+                    Keys.onEscapePressed: root.renamingTabId = ""
+                  }
+
+                  Text {
+                    visible: parent.parent.isActive && root.tabLabels.length > 1
+                    textFormat: Text.PlainText
+                    text: "×"
+                    color: closeMouse.containsMouse ? root.urgent : root.textTertiary
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    MouseArea {
+                      id: closeMouse
+                      anchors.fill: parent
+                      anchors.margins: -Style.space(4)
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.tabClosed(modelData.id)
+                    }
+                  }
+                }
+
+                MouseArea {
+                  id: tabMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  acceptedButtons: Qt.LeftButton
+                  onClicked: root.tabChosen(modelData.id)
+                  onDoubleClicked: root.renamingTabId = modelData.id
+                }
+              }
+            }
+
+            Text {
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "+"
+              color: newMouse.containsMouse ? root.accent : root.textTertiary
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              MouseArea {
+                id: newMouse
+                anchors.fill: parent
+                anchors.margins: -Style.space(6)
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.tabNew()
+              }
+            }
+          }
+        }
+
+        Item {
+          id: body
+        anchors.top: tabStrip.visible ? tabStrip.bottom : header.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         anchors.bottom: composer.top
@@ -1917,6 +2044,21 @@ Item {
             }
             if (event.key === Qt.Key_P && (event.modifiers & Qt.ControlModifier)) {
               root.permissionsRequested()
+              event.accepted = true
+              return
+            }
+            if (event.key === Qt.Key_T && (event.modifiers & Qt.ControlModifier)) {
+              root.tabNew()
+              event.accepted = true
+              return
+            }
+            if (event.key === Qt.Key_W && (event.modifiers & Qt.ControlModifier)) {
+              root.tabClosed(root.activeTabId)
+              event.accepted = true
+              return
+            }
+            if (event.key === Qt.Key_Tab && (event.modifiers & Qt.ControlModifier)) {
+              root.tabCycled((event.modifiers & Qt.ShiftModifier) ? -1 : 1)
               event.accepted = true
               return
             }
