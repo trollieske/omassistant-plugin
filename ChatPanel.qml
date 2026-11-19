@@ -178,15 +178,11 @@ Item {
   readonly property int cornerRadius: Style.cornerRadius
   readonly property int contentMargin: Style.spacing.panelPadding
   readonly property int headerHeight: Math.max(Style.space(34), Style.font.title + Style.spacing.controlPaddingY * 2)
-  // A confirmation that names a whole command needs the room to show it: the row
-  // grows to the text instead of eliding what is being approved.
-  readonly property int brokerSummaryLines: {
-    if (!root.brokerConfirm) return 1
-    var chars = String(root.brokerSummary || "").length
-    return Math.max(1, Math.min(5, Math.ceil(chars / 68)))
-  }
+  // A confirmation that names a whole command needs the room to show it. The
+  // height comes from the text's own painted height — an estimate by character
+  // count is how a line or two goes missing at the end of an approval.
   readonly property int composerHeight: root.brokerConfirm
-    ? Style.space(10) + root.brokerSummaryLines * (Style.font.body + Style.space(5))
+    ? Math.max(Style.space(40), brokerSummaryText.implicitHeight + Style.space(16))
     : Math.max(Style.space(40), Style.font.heading + Style.spacing.inputPaddingY * 2)
   readonly property int footerHeight: Math.max(Style.space(20), Style.font.caption + Style.spacing.md)
   readonly property int sectionGap: Style.spacing.xxl
@@ -1580,6 +1576,7 @@ Item {
           }
 
           Text {
+            id: brokerSummaryText
             anchors.left: parent.left
             anchors.leftMargin: Style.space(22)
             anchors.right: brokerKeys.left
@@ -1592,7 +1589,8 @@ Item {
             text: root.brokerSummary
             color: root.accent
             wrapMode: Text.Wrap
-            maximumLineCount: 5
+            // No maximumLineCount and no elide: the row grows instead of hiding
+            // characters, and the broker caps the operation so the growth is bounded.
             elide: Text.ElideNone
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
@@ -1601,7 +1599,7 @@ Item {
 
           Text {
             id: brokerKeys
-            visible: root.brokerSummaryLines === 1
+            visible: brokerSummaryText.implicitHeight <= Style.space(48)
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
@@ -2199,7 +2197,9 @@ Item {
     if (root.transcribing) return "TRANSCRIBING"
     if (root.lookState === "attached") return "SCREEN"
     if (root.busy) {
-      var label = root.waiting ? "WAITING" : "THINKING"
+      // "WAITING" read as "waiting for you", which it never was: it is a minute of
+      // silence from the model. Say what is actually happening.
+      var label = root.waiting ? "NO REPLY" : "THINKING"
       if (root.busySeconds >= 5) label += " " + root.busySeconds + "S"
       return label
     }
