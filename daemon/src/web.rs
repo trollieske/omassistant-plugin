@@ -369,6 +369,21 @@ fn parse_json(body: &str) -> Result<serde_json::Value, ApiError> {
     })
 }
 
+/// Does this look like an image URL? You.com returns thumbnails, but a result can
+/// also carry a page address in that field, and a broken box under an answer is
+/// worse than no picture.
+#[must_use]
+pub fn looks_like_image(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    [".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif", ".svg"]
+        .iter()
+        .any(|extension| path.ends_with(extension))
+}
+
 /// One search result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
@@ -1130,5 +1145,22 @@ mod tests {
         let (body, code, _) = strip_http_trailer(raw);
         assert_eq!(body, raw);
         assert_eq!(code, 0);
+    }
+    #[test]
+    fn only_image_addresses_become_pictures() {
+        for good in [
+            "https://images.fotmob.com/logo/8007.png",
+            "https://ichef.bbci.co.uk/x.jpg?width=1200",
+            "https://a.espncdn.com/i/leaguelogos/soccer/500/13.png",
+        ] {
+            assert!(looks_like_image(good), "{good}");
+        }
+        for bad in [
+            "https://www.fotmob.com/match/preview?matchId=5105050",
+            "https://example.com/page.html",
+            "",
+        ] {
+            assert!(!looks_like_image(bad), "{bad}");
+        }
     }
 }

@@ -961,7 +961,7 @@ impl Broker {
             // Host and picture only: this is shown, not logged.
             let media: Vec<(String, String)> = hits
                 .iter()
-                .filter(|hit| !hit.image.is_empty())
+                .filter(|hit| crate::web::looks_like_image(&hit.image))
                 .filter_map(|hit| {
                     let host = hit
                         .url

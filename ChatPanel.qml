@@ -751,14 +751,21 @@ Item {
                   }
 
                   TextInput {
+                    id: renameField
                     visible: root.renamingTabId === modelData.id
                     width: Math.min(Style.space(112), implicitWidth)
-                    text: modelData.title
                     color: root.accent
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
                     selectByMouse: true
-                    focus: visible
+                    // Entering a rename fills the field with the current name and
+                    // selects it, so typing replaces instead of appending — what a
+                    // double-click on a name means everywhere else.
+                    onVisibleChanged: if (visible) {
+                      text = modelData.title
+                      selectAll()
+                      forceActiveFocus()
+                    }
                     onAccepted: {
                       root.tabRenamed(modelData.id, text)
                       root.renamingTabId = ""
@@ -1188,7 +1195,8 @@ Item {
           anchors.fill: parent
           // The look preview sits in the gap above the composer; the transcript
           // yields its space instead of being drawn over.
-          anchors.bottomMargin: previewStrip.visible ? previewStrip.height + Style.space(8) : 0
+          anchors.bottomMargin: (previewStrip.visible ? previewStrip.height + Style.space(8) : 0)
+            + (mediaStrip.visible ? mediaStrip.height + Style.space(8) : 0)
           visible: root.bodyContentHeight > 0 && !root.historyMode && !root.setupMode
           clip: true
           boundsBehavior: Flickable.StopAtBounds
@@ -1545,8 +1553,10 @@ Item {
           id: mediaStrip
           anchors.left: parent.left
           anchors.right: parent.right
-          anchors.bottom: parent.bottom
-          anchors.bottomMargin: -Style.space(4)
+          // Above the composer, like the look preview — not on top of the field the
+          // person types in.
+          anchors.bottom: parent.top
+          anchors.bottomMargin: Style.space(8)
           height: visible ? Style.space(30) : 0
           visible: !root.blank && !root.busy && root.mediaImages.length > 0
             && !root.brokerConfirm && !root.lookConsentVisible

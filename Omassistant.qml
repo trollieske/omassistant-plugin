@@ -201,6 +201,11 @@ Item {
   property var tabs: []
   property string activeTabId: ""
   property int tabSerial: 1
+  // The session a fresh conversation is replacing, and the tab waiting for its own.
+  // pi keeps reporting the old session file until the new one has a first message,
+  // and assigning that to a new tab made two tabs share one conversation.
+  property string blankTabId: ""
+  property string blankTabFrom: ""
   property bool companionCollapsed: false
   property bool uiLoaded: false
 
@@ -406,6 +411,7 @@ Item {
       session: runtime.currentSessionFile,
       memory: root.memory,
       tabs: root.tabLabels(),
+      media: root.mediaImages.length,
       activeTab: root.activeTabId,
       sessions: root.sessions.length,
       look: root.lookState,
@@ -473,8 +479,8 @@ Item {
     var out = []
     for (var i = 0; i < root.tabs.length; i++) {
       var tab = root.tabs[i]
-      out.push({ id: String(tab.id), title: root.tabTitle(tab), active: String(tab.id) === root.activeTabId,
-        file: String(tab.file || "") })
+      out.push({ id: String(tab.id), title: root.tabTitle(tab),
+        active: String(tab.id) === root.activeTabId, file: String(tab.file || "") })
     }
     return out
   }
@@ -628,6 +634,8 @@ Item {
     root.brokerConfirm = false
     deltaFlush.stop()
     root.pendingDelta = ""
+    root.blankTabId = root.activeTabId
+    root.blankTabFrom = runtime.currentSessionFile
     transcriptModel.clear()
     root.assistantIndex = -1
     root.lastQuestion = ""
@@ -718,6 +726,8 @@ Item {
       // confirmation still waiting in the broker, so a stopped answer cannot
       // leave a tool call blocked for a minute.
       daemon.call("consent.revoke_run", {}, function() { root.refreshGrants() })
+      // The pictures the search behind this answer came with, if it used one.
+      root.refreshMedia()
       if (root.opened) Qt.callLater(function() { panel.focusComposer() })
     }
     root.publishState()
@@ -3436,9 +3446,21 @@ Item {
   }
 
   function onSessionReady(file, id, count) {
-    // The tab follows the session: a new tab has no file until its first message.
+    // The tab follows the session — but a conversation that was just replaced keeps
+    // reporting the old file until the new one has a message. That file belongs to
+    // the tab we came from, not to this one.
     root.ensureTabs()
-    root.setActiveTabFile(file)
+    if (root.blankTabId.length) {
+      if (String(file) === root.blankTabFrom || String(file).length === 0) {
+        // Still the old session: nothing to assign yet.
+      } else {
+        root.blankTabId = ""
+        root.blankTabFrom = ""
+        root.setActiveTabFile(file)
+      }
+    } else {
+      root.setActiveTabFile(file)
+    }
     root.publishState()
     if (runtime.live) runtime.requestModels()
     if (!root.memory) {
